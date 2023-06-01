@@ -130,7 +130,15 @@ foreach(sdk ${SWIFT_SDKS})
     set(module_dir "${SWIFTLIB_DIR}/${arch_subdir}")
     set(module_dir_static "${SWIFTSTATICLIB_DIR}/${arch_subdir}")
 
-    set(glibc_modulemap_source "glibc.modulemap.gyb")
+    if(${sdk} STREQUAL ANDROID)
+      set(glibc_modulemap_source "bionic.modulemap.gyb")
+    elseif(${sdk} STREQUAL OPENBSD)
+      set(glibc_modulemap_source "libc-openbsd.modulemap.gyb")
+    elseif(${sdk} STREQUAL FREEBSD)
+      set(glibc_modulemap_source "libc-freebsd.modulemap.gyb")
+    else()
+      set(glibc_modulemap_source "glibc.modulemap.gyb")
+    endif()
     set(glibc_modulemap_out "${module_dir}/glibc.modulemap")
     set(glibc_modulemap_out_static "${module_dir_static}/glibc.modulemap")
 
@@ -162,12 +170,16 @@ foreach(sdk ${SWIFT_SDKS})
       list(APPEND glibc_modulemap_target_list ${copy_glibc_modulemap_static})
     endif()
 
-    set(glibc_header_out "${module_dir}/SwiftGlibc.h")
-    handle_gyb_source_single(glibc_header_target
-        SOURCE "SwiftGlibc.h.gyb"
-        OUTPUT "${glibc_header_out}"
-        FLAGS "-DCMAKE_SDK=${sdk}")
-    list(APPEND glibc_modulemap_target_list ${glibc_header_target})
+    # FreeBSD uses a different module map that does not use this header,
+    # so we don't generate it
+    if(NOT ${sdk} STREQUAL FREEBSD)
+      set(glibc_header_out "${module_dir}/SwiftGlibc.h")
+      handle_gyb_source_single(glibc_header_target
+          SOURCE "SwiftGlibc.h.gyb"
+          OUTPUT "${glibc_header_out}"
+          FLAGS "-DCMAKE_SDK=${sdk}")
+      list(APPEND glibc_modulemap_target_list ${glibc_header_target})
+    endif()
 
     # If this SDK is a target for a non-native host, except if it's for Android
     # with its own native sysroot, create a native modulemap without a sysroot
@@ -183,7 +195,8 @@ foreach(sdk ${SWIFT_SDKS})
         SOURCE "${glibc_modulemap_source}"
         OUTPUT "${glibc_sysroot_relative_modulemap_out}"
         FLAGS "-DCMAKE_SDK=${sdk}"
-              "-DGLIBC_INCLUDE_PATH=${absolute_libc_include_path}")
+              "-DGLIBC_INCLUDE_PATH=${absolute_libc_include_path}"
+              "-DGLIBC_ARCH_INCLUDE_PATH=${absolute_libc_arch_include_path}")
 
       list(APPEND glibc_modulemap_target_list ${glibc_modulemap_native_target})
       set(glibc_modulemap_out ${glibc_sysroot_relative_modulemap_out})

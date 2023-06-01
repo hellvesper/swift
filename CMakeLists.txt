@@ -93,11 +93,11 @@ option(SWIFT_BUILD_DYNAMIC_STDLIB
 option(SWIFT_BUILD_STATIC_STDLIB
     "Build static variants of the Swift standard library"
     FALSE)
-    
+
 option(SWIFT_STDLIB_STATIC_PRINT
     "Build compile-time evaluated vprintf()"
     FALSE)
-    
+
 option(SWIFT_STDLIB_ENABLE_UNICODE_DATA
     "Include Unicode data files in the standard library.
     NOTE: Disabling this will cause many String methods to crash."
@@ -188,7 +188,24 @@ set(SWIFT_COMPILER_VERSION "" CACHE STRING
 set(CLANG_COMPILER_VERSION "" CACHE STRING
     "The internal version of the Clang compiler")
 
-option(SWIFT_DISABLE_DEAD_STRIPPING
+# Which default linker to use. Prefer LLVM_USE_LINKER if it set, otherwise use
+# our own defaults. This should only be possible in a unified (not stand alone)
+# build environment.
+if(LLVM_USE_LINKER)
+  set(SWIFT_USE_LINKER_default "${LLVM_USE_LINKER}")
+elseif(CMAKE_SYSTEM_NAME STREQUAL Windows AND NOT CMAKE_HOST_SYSTEM_NAME STREQUAL Windows)
+  set(SWIFT_USE_LINKER_default "lld")
+elseif(CMAKE_SYSTEM_NAME STREQUAL Darwin)
+  set(SWIFT_USE_LINKER_default "")
+elseif(CMAKE_SYSTEM_NAME STREQUAL FreeBSD)
+  set(SWIFT_USE_LINKER_default "")
+else()
+  set(SWIFT_USE_LINKER_default "gold")
+endif()
+set(SWIFT_USE_LINKER ${SWIFT_USE_LINKER_default} CACHE STRING
+    "Build Swift with a non-default linker")
+
+option(SWIFT_DISABLE_DEAD_STRIPPING 
       "Turn off Darwin-specific dead stripping for Swift host tools." FALSE)
 
 set(SWIFT_TOOLS_ENABLE_LTO OFF CACHE STRING "Build Swift tools with LTO. One
@@ -319,6 +336,23 @@ set(SWIFT_ANDROID_NDK_CLANG_VERSION "12.0.8" CACHE STRING
   "The Clang version to use when building for Android.")
 set(SWIFT_ANDROID_DEPLOY_DEVICE_PATH "" CACHE STRING
   "Path on an Android device where build products will be pushed. These are used when running the test suite against the device")
+
+#
+# User-configurable ICU specific options for Android, FreeBSD, Linux, Haiku, and WASI.
+#
+
+foreach(sdk ANDROID;FREEBSD;LINUX;WINDOWS;HAIKU;WASI)
+  foreach(arch aarch64;armv6;armv7;i686;powerpc64;powerpc64le;s390x;wasm32;x86_64)
+    set(SWIFT_${sdk}_${arch}_ICU_UC "" CACHE STRING
+        "Path to a directory containing the icuuc library for ${sdk}")
+    set(SWIFT_${sdk}_${arch}_ICU_UC_INCLUDE "" CACHE STRING
+        "Path to a directory containing headers for icuuc for ${sdk}")
+    set(SWIFT_${sdk}_${arch}_ICU_I18N "" CACHE STRING
+        "Path to a directory containing the icui18n library for ${sdk}")
+    set(SWIFT_${sdk}_${arch}_ICU_I18N_INCLUDE "" CACHE STRING
+        "Path to a directory containing headers icui18n for ${sdk}")
+  endforeach()
+endforeach()
 
 #
 # User-configurable Darwin-specific options.
@@ -737,7 +771,7 @@ endif()
 if(SWIFT_HOST_VARIANT_ARCH)
   set(SWIFT_HOST_VARIANT_ARCH_default "${SWIFT_HOST_VARIANT_ARCH}")
 else()
-  if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     set(SWIFT_HOST_VARIANT_ARCH_default "x86_64")
   elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
     if(SWIFT_HOST_VARIANT_SDK_default STREQUAL OSX)
@@ -775,23 +809,6 @@ set(SWIFT_HOST_VARIANT_SDK "${SWIFT_HOST_VARIANT_SDK_default}" CACHE STRING
     "Deployment sdk for Swift host tools (the compiler).")
 set(SWIFT_HOST_VARIANT_ARCH "${SWIFT_HOST_VARIANT_ARCH_default}" CACHE STRING
     "Deployment arch for Swift host tools (the compiler).")
-
-# Which default linker to use. Prefer LLVM_USE_LINKER if it set, otherwise use
-# our own defaults. This should only be possible in a unified (not stand alone)
-# build environment.
-if(LLVM_USE_LINKER)
-  set(SWIFT_USE_LINKER_default "${LLVM_USE_LINKER}")
-elseif(${SWIFT_HOST_VARIANT_SDK} STREQUAL ANDROID)
-  set(SWIFT_USE_LINKER_default "lld")
-elseif(CMAKE_SYSTEM_NAME STREQUAL Windows AND NOT CMAKE_HOST_SYSTEM_NAME STREQUAL Windows)
-  set(SWIFT_USE_LINKER_default "lld")
-elseif(CMAKE_SYSTEM_NAME STREQUAL Darwin)
-  set(SWIFT_USE_LINKER_default "")
-else()
-  set(SWIFT_USE_LINKER_default "gold")
-endif()
-set(SWIFT_USE_LINKER ${SWIFT_USE_LINKER_default} CACHE STRING
-    "Build Swift with a non-default linker")
 
 #
 # Enable additional warnings.
@@ -1051,6 +1068,37 @@ endif()
 #
 # Find required dependencies.
 #
+
+function(swift_icu_variables_set sdk arch result)
+  string(TOUPPER "${sdk}" sdk)
+
+  set(icu_var_ICU_UC_INCLUDE ${SWIFT_${sdk}_${arch}_ICU_UC_INCLUDE})
+  set(icu_var_ICU_UC ${SWIFT_${sdk}_${arch}_ICU_UC})
+  set(icu_var_ICU_I18N_INCLUDE ${SWIFT_${sdk}_${arch}_ICU_I18N_INCLUDE})
+  set(icu_var_ICU_I18N ${SWIFT_${sdk}_${arch}_ICU_I18N})
+
+  if(icu_var_ICU_UC_INCLUDE AND icu_var_ICU_UC AND
+     icu_var_ICU_I18N_INCLUDE AND icu_var_ICU_I18N)
+    set(${result} TRUE PARENT_SCOPE)
+  else()
+    set(${result} FALSE PARENT_SCOPE)
+  endif()
+endfunction()
+
+# ICU is provided through CoreFoundation on Darwin.  On other hosts, if the ICU
+# unicode and i18n include and library paths are not defined, perform a standard
+# package lookup.  Otherwise, rely on the paths specified by the user.  These
+# need to be defined when cross-compiling.
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  if(SWIFT_BUILD_STDLIB OR SWIFT_BUILD_SDK_OVERLAY)
+    swift_icu_variables_set("${SWIFT_PRIMARY_VARIANT_SDK}"
+                            "${SWIFT_PRIMARY_VARIANT_ARCH}"
+                            ICU_CONFIGURED)
+    if("${SWIFT_PATH_TO_LIBICU_BUILD}" STREQUAL "" AND NOT ${ICU_CONFIGURED})
+      find_package(ICU REQUIRED COMPONENTS uc i18n)
+    endif()
+  endif()
+endif()
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
