@@ -151,7 +151,8 @@ foreach(sdk ${SWIFT_SDKS})
         OUTPUT "${glibc_modulemap_out}"
         FLAGS
             "-DCMAKE_SDK=${sdk}"
-            "-DGLIBC_INCLUDE_PATH=${SWIFT_SDK_${sdk}_ARCH_${arch}_LIBC_INCLUDE_DIRECTORY}")
+            "-DGLIBC_INCLUDE_PATH=${SWIFT_SDK_${sdk}_ARCH_${arch}_LIBC_INCLUDE_DIRECTORY}"
+            "-DGLIBC_ARCH_INCLUDE_PATH=${SWIFT_SDK_${sdk}_ARCH_${arch}_LIBC_ARCHITECTURE_INCLUDE_DIRECTORY}")
 
     list(APPEND glibc_modulemap_target_list ${glibc_modulemap_target})
 
@@ -195,7 +196,8 @@ foreach(sdk ${SWIFT_SDKS})
         SOURCE "${glibc_modulemap_source}"
         OUTPUT "${glibc_sysroot_relative_modulemap_out}"
         FLAGS "-DCMAKE_SDK=${sdk}"
-              "-DGLIBC_INCLUDE_PATH=${absolute_libc_include_path}")
+              "-DGLIBC_INCLUDE_PATH=${absolute_libc_include_path}"
+              "-DGLIBC_ARCH_INCLUDE_PATH=${absolute_libc_arch_include_path}")
 
       list(APPEND glibc_modulemap_target_list ${glibc_modulemap_native_target})
       set(glibc_modulemap_out ${glibc_sysroot_relative_modulemap_out})
