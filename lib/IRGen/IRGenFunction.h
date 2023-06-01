@@ -222,9 +222,10 @@ public:
 
   StackAddress emitDynamicAlloca(SILType type, const llvm::Twine &name = "");
   StackAddress emitDynamicAlloca(llvm::Type *eltTy, llvm::Value *arraySize,
-                                 Alignment align,
+                                 Alignment align, bool allowTaskAlloc = true,
                                  const llvm::Twine &name = "");
-  void emitDeallocateDynamicAlloca(StackAddress address);
+  void emitDeallocateDynamicAlloca(StackAddress address,
+                                   bool allowTaskDealloc = true);
 
   llvm::BasicBlock *createBasicBlock(const llvm::Twine &Name);
   const TypeInfo &getTypeInfoForUnlowered(Type subst);
@@ -293,6 +294,10 @@ public:
   void emitDeallocBoxCall(llvm::Value *box, llvm::Value *typeMetadata);
 
   void emitTSanInoutAccessCall(llvm::Value *address);
+
+  llvm::Value *emitTargetOSVersionAtLeastCall(llvm::Value *major,
+                                              llvm::Value *minor,
+                                              llvm::Value *patch);
 
   llvm::Value *emitProjectBoxCall(llvm::Value *box, llvm::Value *typeMetadata);
 
@@ -364,8 +369,20 @@ public:
 private:
   llvm::Instruction *AllocaIP;
   const SILDebugScope *DbgScope;
+  /// The insertion point where we should but instructions we would normally put
+  /// at the beginning of the function. LLVM's coroutine lowering really does
+  /// not like it if we put instructions with side-effectrs before the
+  /// coro.begin.
+  llvm::Instruction *EarliestIP;
 
-//--- Reference-counting methods -----------------------------------------------
+public:
+  void setEarliestInsertionPoint(llvm::Instruction *inst) { EarliestIP = inst; }
+  /// Returns the first insertion point before which we should insert
+  /// instructions which have side-effects.
+  llvm::Instruction *getEarliestInsertionPoint() const { return EarliestIP; }
+
+  //--- Reference-counting methods
+  //-----------------------------------------------
 public:
   // Returns the default atomicity of the module.
   Atomicity getDefaultAtomicity();

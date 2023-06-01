@@ -235,6 +235,10 @@ struct PrintOptions {
   /// Whether to print unavailable parts of the AST.
   bool SkipUnavailable = false;
 
+  /// Whether to print synthesized extensions created by '@_nonSendable', even
+  /// if SkipImplicit or SkipUnavailable is set.
+  bool AlwaysPrintNonSendableExtensions = true;
+
   bool SkipSwiftPrivateClangDecls = false;
 
   /// Whether to skip internal stdlib declarations.
@@ -271,6 +275,10 @@ struct PrintOptions {
   bool PrintLongAttrsOnSeparateLines = false;
 
   bool PrintImplicitAttrs = true;
+
+  /// Whether to print the \c any keyword for existential
+  /// types.
+  bool PrintExplicitAny = false;
 
   /// Whether to skip keywords with a prefix of underscore such as __consuming.
   bool SkipUnderscoredKeywords = false;
@@ -345,6 +353,10 @@ struct PrintOptions {
 
   /// Whether to print 'static' or 'class' on static decls.
   bool PrintStaticKeyword = true;
+
+  /// Whether to print 'mutating', 'nonmutating', or '__consuming' keyword on
+  /// specified decls.
+  bool PrintSelfAccessKindKeyword = true;
 
   /// Whether to print 'override' keyword on overridden decls.
   bool PrintOverrideKeyword = true;
@@ -472,6 +484,10 @@ struct PrintOptions {
   /// Whether to print feature checks for compatibility with older Swift
   /// compilers that might parse the result.
   bool PrintCompatibilityFeatureChecks = false;
+
+  /// Whether to print @_specialize attributes that have an availability
+  /// parameter.
+  bool PrintSpecializeAttributeWithAvailability = true;
 
   /// \see ShouldQualifyNestedDeclarations
   enum class QualifyNestedDeclarations {
@@ -659,6 +675,7 @@ struct PrintOptions {
     PO.ShouldQualifyNestedDeclarations = QualifyNestedDeclarations::TypesOnly;
     PO.PrintParameterSpecifiers = true;
     PO.SkipImplicit = true;
+    PO.AlwaysPrintNonSendableExtensions = false;
     PO.AlwaysTryPrintParameterLabels = true;
     return PO;
   }

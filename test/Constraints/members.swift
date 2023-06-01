@@ -28,7 +28,7 @@ func g0(_: (inout X) -> (Float) -> ()) {}
 _ = x.f0(i)
 x.f0(i).f1(i)
 
-g0(X.f1) // expected-error{{partial application of 'mutating' method}}
+g0(X.f1) // expected-error{{cannot reference 'mutating' method as function value}}
 
 _ = x.f0(x.f2(1))
 _ = x.f0(1).f2(i)
@@ -74,7 +74,7 @@ struct GZ<T> {
 
 var z = Z(i: 0)
 var getI = z.getI
-var incI = z.incI // expected-error{{partial application of 'mutating'}}
+var incI = z.incI // expected-error{{cannot reference 'mutating' method as function value}}
 var zi = z.getI()
 var zcurried1 = z.curried
 var zcurried2 = z.curried(0)
@@ -622,7 +622,6 @@ func rdar_50467583_and_50909555() {
     // expected-note@-2 {{found candidate with type '(Int) -> Int'}}
     // expected-note@-3 {{found candidate with type '(Range<Int>) -> ArraySlice<Int>'}}
     // expected-note@-4 {{found candidate with type '((UnboundedRange_) -> ()) -> ArraySlice<Int>'}}
-    // expected-note@-5 {{found candidate with type '(Range<Array<Int>.Index>) -> Slice<[Int]>' (aka '(Range<Int>) -> Slice<Array<Int>>')}}
   }
   
   // rdar://problem/50909555

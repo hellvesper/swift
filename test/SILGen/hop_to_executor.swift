@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend -emit-silgen %s -module-name test -swift-version 5 -enable-experimental-concurrency | %FileCheck --enable-var-scope %s --implicit-check-not 'hop_to_executor {{%[0-9]+}}'
+// RUN: %target-swift-frontend -emit-silgen %s -module-name test -swift-version 5  -disable-availability-checking | %FileCheck --enable-var-scope %s --implicit-check-not 'hop_to_executor {{%[0-9]+}}'
 // REQUIRES: concurrency
 
 
@@ -93,6 +93,20 @@ struct GlobalActor {
 func testGlobalActor() async {
 }
 
+// CHECK-LABEL: sil hidden [ossa] @$s4test0A17GlobalActorUnsafeyyYaF : $@convention(thin) @async () -> () {
+// CHECK:   [[F:%[0-9]+]] = function_ref @$s4test11GlobalActorV6sharedAA02MyC0Cvau : $@convention(thin) () -> Builtin.RawPointer
+// CHECK:   [[P:%[0-9]+]] = apply [[F]]() : $@convention(thin) () -> Builtin.RawPointer
+// CHECK:   [[A:%[0-9]+]] = pointer_to_address %2 : $Builtin.RawPointer to [strict] $*MyActor
+// CHECK:   [[ACC:%[0-9]+]] = begin_access [read] [dynamic] [[A]] : $*MyActor
+// CHECK:   [[L:%[0-9]+]] = load [copy] [[ACC]] : $*MyActor
+// CHECK:   [[B:%[0-9]+]] = begin_borrow [[L]] : $MyActor
+// CHECK:   hop_to_executor [[B]] : $MyActor
+// CHECK: }
+@GlobalActor
+@preconcurrency
+func testGlobalActorUnsafe() async {
+}
+
 ///// testGlobalActorWithClosure()
 // CHECK: sil hidden [ossa] @$s4test0A22GlobalActorWithClosureyyYaF : $@convention(thin) @async () -> () {
 // CHECK:     hop_to_executor [[A:%[0-9]+]] : $MyActor
@@ -158,7 +172,7 @@ actor BlueActorImpl {
 // CHECK:     bb0([[BLUE:%[0-9]+]] : @guaranteed $BlueActorImpl):
 // CHECK:       hop_to_executor [[BLUE]] : $BlueActorImpl
 // CHECK:       [[RED:%[0-9]+]] = apply {{%[0-9]+}}({{%[0-9]+}}) : $@convention(method) (@thick RedActorImpl.Type) -> @owned RedActorImpl
-// CHECK:       [[REDBORROW:%[0-9]+]] = begin_borrow [[RED]] : $RedActorImpl
+// CHECK:       [[REDBORROW:%[0-9]+]] = begin_borrow [lexical] [[RED]] : $RedActorImpl
 // CHECK:       [[INTARG:%[0-9]+]] = apply {{%[0-9]+}}({{%[0-9]+}}, {{%[0-9]+}}) : $@convention(method) (Builtin.IntLiteral, @thin Int.Type) -> Int
 // CHECK:       [[METH:%[0-9]+]] = class_method [[REDBORROW]] : $RedActorImpl, #RedActorImpl.hello : (isolated RedActorImpl) -> (Int) -> (), $@convention(method) (Int, @guaranteed RedActorImpl) -> ()
 // CHECK:       hop_to_executor [[REDBORROW]] : $RedActorImpl
@@ -355,4 +369,37 @@ func testGenericGlobalActorClosure<T>(_: T) {
   let ggat: @GenericGlobalActorWithGetter<T> (T) -> T
     = { @GenericGlobalActorWithGetter<T> x in x }
   acceptAsyncClosure2(ggat)
+}
+
+func acceptIsolatedParam(_: Int, _: isolated MyActor, _: Double) { }
+
+extension MyActor {
+  nonisolated func otherIsolated(_: Int, _: isolated MyActor, _: Double) { }
+}
+
+// CHECK: sil hidden [ossa] @$s4test0A26ImplicitAsyncIsolatedParam1i1d5actor10otherActorySi_SdAA02MyH0CAHtYaF
+func testImplicitAsyncIsolatedParam(
+  i: Int, d: Double, actor: MyActor, otherActor: MyActor
+) async {
+  // CHECK: [[FN1:%.*]] = function_ref @$s4test19acceptIsolatedParamyySi_AA7MyActorCYiSdtF
+  // CHECK-NEXT: [[CURRENT:%.*]] = builtin "getCurrentExecutor"() : $Optional<Builtin.Executor>
+  // CHECK-NEXT: hop_to_executor %2 : $MyActor
+  // CHECK-NEXT: apply [[FN1]](%0, %2, %1) : $@convention(thin) (Int, @guaranteed MyActor, Double) -> ()
+  // CHECK-NEXT: hop_to_executor [[CURRENT]] : $Optional<Builtin.Executor>
+  await acceptIsolatedParam(i, actor, d)
+
+  // CHECK: [[FN2:%.*]] = function_ref @$s4test7MyActorC13otherIsolatedyySi_ACYiSdtF : $@convention(method) (Int, @guaranteed MyActor, Double, @guaranteed MyActor) -> ()
+  // CHECK-NEXT: [[CURRENT:%.*]] = builtin "getCurrentExecutor"() : $Optional<Builtin.Executor>
+  // CHECK-NEXT: hop_to_executor %2 : $MyActor
+  // CHECK-NEXT: apply [[FN2]](%0, %2, %1, %3) : $@convention(method) (Int, @guaranteed MyActor, Double, @guaranteed MyActor) -> ()
+  // CHECK-NEXT: hop_to_executor [[CURRENT]] : $Optional<Builtin.Executor>
+  await otherActor.otherIsolated(i, actor, d)
+}
+
+// CHECK-LABEL: sil hidden [ossa] @$s4test22asyncWithIsolatedParam1i5actor1dySi_AA7MyActorCYiSdtYaF : $@convention(thin) @async (Int, @guaranteed MyActor, Double) -> ()
+func asyncWithIsolatedParam(i: Int, actor: isolated MyActor, d: Double) async {
+  // CHECK: [[ACTOR:%.*]] = copy_value %1 : $MyActor
+  // CHECK-NEXT: [[BORROWED:%.*]] = begin_borrow [[ACTOR]] : $MyActor
+  // CHECK-NEXT: hop_to_executor [[BORROWED]] : $MyActor
+  // CHECK-NEXT: end_borrow [[BORROWED]] : $MyActor
 }

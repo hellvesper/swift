@@ -47,7 +47,8 @@ namespace swift {
   struct PrintOptions;
 
   /// Typecheck binding initializer at \p bindingIndex.
-  void typeCheckPatternBinding(PatternBindingDecl *PBD, unsigned bindingIndex);
+  void typeCheckPatternBinding(PatternBindingDecl *PBD, unsigned bindingIndex,
+                               bool leaveClosureBodiesUnchecked);
 
   /// Check if T1 is convertible to T2.
   ///
@@ -138,6 +139,13 @@ namespace swift {
 
   LookupResult
   lookupSemanticMember(DeclContext *DC, Type ty, DeclName name);
+
+  /// Get all of the top-level declarations that should be printed as part of
+  /// this module. This may force synthesis of top-level declarations that
+  /// \c ModuleDecl::getDisplayDecls() would only return if previous
+  /// work happened to have synthesized them.
+  void
+  getTopLevelDeclsForDisplay(ModuleDecl *M, SmallVectorImpl<Decl*> &Results, bool Recursive = false);
 
   struct ExtensionInfo {
     // The extension with the declarations to apply.
@@ -233,25 +241,6 @@ namespace swift {
                            std::vector<VariableTypeInfo> &VariableTypeInfos,
                            llvm::raw_ostream &OS);
 
-  /// FIXME: All of the below goes away once CallExpr directly stores its
-  /// arguments.
-
-  /// Return value for getOriginalArgumentList().
-  struct OriginalArgumentList {
-    SmallVector<Expr *, 4> args;
-    SmallVector<Identifier, 4> labels;
-    SmallVector<SourceLoc, 4> labelLocs;
-    SourceLoc lParenLoc;
-    SourceLoc rParenLoc;
-    bool hasTrailingClosure = false;
-  };
-
-  /// When applying a solution to a constraint system, the type checker rewrites
-  /// argument lists of calls to insert default arguments and collect varargs.
-  /// Sometimes for diagnostics we want to work on the original argument list as
-  /// written by the user; this performs the reverse transformation.
-  OriginalArgumentList getOriginalArgumentList(Expr *expr);
-
   /// Returns the root type and result type of the keypath type in a keypath
   /// dynamic member lookup subscript, or \c None if it cannot be determined.
   ///
@@ -305,6 +294,9 @@ namespace swift {
   /// for a Fix-It that adds a new build* function to a result builder.
   std::tuple<SourceLoc, std::string, Type>
   determineResultBuilderBuildFixItInfo(NominalTypeDecl *builder);
+
+  /// Just a proxy to swift::contextUsesConcurrencyFeatures() from lib/IDE code.
+  bool completionContextUsesConcurrencyFeatures(const DeclContext *dc);
 }
 
 #endif

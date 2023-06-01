@@ -171,7 +171,7 @@ namespace {
                                    const TypeLowering &expectedTL);
   };
 } // end anonymous namespace
-;
+
 
 static ArrayRef<ProtocolConformanceRef>
 collectExistentialConformances(ModuleDecl *M, CanType fromType, CanType toType) {
@@ -220,7 +220,7 @@ static ManagedValue emitTransformExistential(SILGenFunction &SGF,
     fromInstanceType = cast<MetatypeType>(fromInstanceType)
       .getInstanceType();
     toInstanceType = cast<ExistentialMetatypeType>(toInstanceType)
-      .getInstanceType();
+      ->getExistentialInstanceType()->getCanonicalType();
   }
 
   ArrayRef<ProtocolConformanceRef> conformances =
@@ -339,7 +339,7 @@ static bool isProtocolClass(Type t) {
   ASTContext &ctx = classDecl->getASTContext();
   return (classDecl->getName() == ctx.Id_Protocol &&
           classDecl->getModuleContext()->getName() == ctx.Id_ObjectiveC);
-};
+}
 
 static ManagedValue emitManagedLoad(SILGenFunction &SGF, SILLocation loc,
                                     ManagedValue addr,
@@ -923,7 +923,7 @@ namespace {
         auto outputOrigType = AbstractionPattern::getTuple(outputOrigTypes);
 
         // Build the substituted output tuple type. Note that we deliberately
-        // don't use composeInput() because we want to drop ownership
+        // don't use composeTuple() because we want to drop ownership
         // qualifiers.
         SmallVector<TupleTypeElt, 8> elts;
         for (auto param : outputSubstTypes) {
@@ -3045,21 +3045,25 @@ buildThunkSignature(SILGenFunction &SGF,
     if (auto genericSig =
           SGF.F.getLoweredFunctionType()->getInvocationGenericSignature()) {
       baseGenericSig = genericSig;
-      depth = genericSig->getGenericParams().back()->getDepth() + 1;
+      depth = genericSig.getGenericParams().back()->getDepth() + 1;
     }
   }
 
   // Add a new generic parameter to replace the opened existential.
-  auto *newGenericParam = GenericTypeParamType::get(depth, 0, ctx);
-  Requirement newRequirement(RequirementKind::Conformance, newGenericParam,
-                             openedExistential->getOpenedExistentialType());
+  auto *newGenericParam =
+      GenericTypeParamType::get(/*type sequence*/ false, depth, 0, ctx);
 
-  auto genericSig = evaluateOrDefault(
-      ctx.evaluator,
-      AbstractGenericSignatureRequest{
-        baseGenericSig.getPointer(), { newGenericParam }, { newRequirement }},
-      GenericSignature());
-  genericEnv = genericSig->getGenericEnvironment();
+  auto constraint = openedExistential->getOpenedExistentialType();
+  if (auto existential = constraint->getAs<ExistentialType>())
+    constraint = existential->getConstraintType();
+
+  Requirement newRequirement(RequirementKind::Conformance, newGenericParam,
+                             constraint);
+
+  auto genericSig = buildGenericSignature(ctx, baseGenericSig,
+                                          { newGenericParam },
+                                          { newRequirement });
+  genericEnv = genericSig.getGenericEnvironment();
 
   newArchetype = genericEnv->mapTypeIntoContext(newGenericParam)
     ->castTo<ArchetypeType>();
@@ -3938,15 +3942,10 @@ SILFunction *SILGenModule::getOrCreateCustomDerivativeThunk(
     SILFunction *customDerivativeFn, const AutoDiffConfig &config,
     AutoDiffDerivativeFunctionKind kind) {
   auto customDerivativeFnTy = customDerivativeFn->getLoweredFunctionType();
-  auto *thunkGenericEnv = customDerivativeFnTy->getSubstGenericSignature()
-                              ? customDerivativeFnTy->getSubstGenericSignature()
-                                    ->getGenericEnvironment()
-                              : nullptr;
+  auto *thunkGenericEnv = customDerivativeFnTy->getSubstGenericSignature().getGenericEnvironment();
 
   auto origFnTy = originalFn->getLoweredFunctionType();
-  CanGenericSignature derivativeCanGenSig;
-  if (auto derivativeGenSig = config.derivativeGenericSignature)
-    derivativeCanGenSig = derivativeGenSig->getCanonicalSignature();
+  auto derivativeCanGenSig = config.derivativeGenericSignature.getCanonicalSignature();
   auto thunkFnTy = origFnTy->getAutoDiffDerivativeFunctionType(
       config.parameterIndices, config.resultIndices, kind, Types,
       LookUpConformanceInModule(M.getSwiftModule()), derivativeCanGenSig);

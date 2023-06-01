@@ -287,10 +287,10 @@ public:
   void cacheResult(bool value) const;
 };
 
-/// Determine whether we are allowed to refer to an existential type conforming
-/// to this protocol.
-class ExistentialTypeSupportedRequest :
-    public SimpleRequest<ExistentialTypeSupportedRequest,
+/// Determine whether an existential type conforming to this protocol
+/// requires the \c any syntax.
+class ExistentialRequiresAnyRequest :
+    public SimpleRequest<ExistentialRequiresAnyRequest,
                          bool(ProtocolDecl *),
                          RequestFlags::SeparatelyCached> {
 public:
@@ -394,6 +394,84 @@ public:
   void cacheResult(bool value) const;
 };
 
+class StructuralRequirementsRequest :
+    public SimpleRequest<StructuralRequirementsRequest,
+                         ArrayRef<StructuralRequirement>(ProtocolDecl *),
+                         RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  ArrayRef<StructuralRequirement>
+  evaluate(Evaluator &evaluator, ProtocolDecl *proto) const;
+
+public:
+  // Caching.
+  bool isCached() const { return true; }
+};
+
+class TypeAliasRequirementsRequest :
+    public SimpleRequest<TypeAliasRequirementsRequest,
+                         ArrayRef<Requirement>(ProtocolDecl *),
+                         RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  ArrayRef<Requirement>
+  evaluate(Evaluator &evaluator, ProtocolDecl *proto) const;
+
+public:
+  // Caching.
+  bool isCached() const { return true; }
+};
+
+class ProtocolDependenciesRequest :
+    public SimpleRequest<ProtocolDependenciesRequest,
+                         ArrayRef<ProtocolDecl *>(ProtocolDecl *),
+                         RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  ArrayRef<ProtocolDecl *>
+  evaluate(Evaluator &evaluator, ProtocolDecl *proto) const;
+
+public:
+  // Caching.
+  bool isCached() const { return true; }
+};
+
+/// Compute a protocol's requirement signature using the RequirementMachine.
+/// This is temporary; once the GenericSignatureBuilder goes away this will
+/// be folded into RequirementSignatureRequest.
+class RequirementSignatureRequestRQM :
+    public SimpleRequest<RequirementSignatureRequestRQM,
+                         ArrayRef<Requirement>(ProtocolDecl *),
+                         RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  ArrayRef<Requirement>
+  evaluate(Evaluator &evaluator, ProtocolDecl *proto) const;
+
+public:
+  bool isCached() const { return true; }
+};
+
 /// Compute the requirements that describe a protocol.
 class RequirementSignatureRequest :
     public SimpleRequest<RequirementSignatureRequest,
@@ -447,6 +525,8 @@ struct WhereClauseOwner {
                      SpecializeAttr *, DifferentiableAttr *>
       source;
 
+  WhereClauseOwner() : dc(nullptr) {}
+
   WhereClauseOwner(GenericContext *genCtx);
   WhereClauseOwner(AssociatedTypeDecl *atd);
 
@@ -466,6 +546,10 @@ struct WhereClauseOwner {
 
   friend hash_code hash_value(const WhereClauseOwner &owner) {
     return llvm::hash_value(owner.source.getOpaqueValue());
+  }
+
+  operator bool() const {
+    return dc != nullptr;
   }
 
   friend bool operator==(const WhereClauseOwner &lhs,
@@ -933,18 +1017,18 @@ public:
     bool isCached() const { return true; }
 };
 
-/// Determine whether the given func is distributed.
-class IsDistributedFuncRequest :
-    public SimpleRequest<IsDistributedFuncRequest,
-        bool(FuncDecl *),
-        RequestFlags::Cached> {
+/// Obtain the 'remote' counterpart of a 'distributed func'.
+class GetDistributedRemoteFuncRequest :
+    public SimpleRequest<GetDistributedRemoteFuncRequest,
+                         AbstractFunctionDecl *(AbstractFunctionDecl *),
+                         RequestFlags::Cached> {
 public:
-    using SimpleRequest::SimpleRequest;
+  using SimpleRequest::SimpleRequest;
 
 private:
-    friend SimpleRequest;
+  friend SimpleRequest;
 
-    bool evaluate(Evaluator &evaluator, FuncDecl *func) const;
+  AbstractFunctionDecl *evaluate(Evaluator &evaluator, AbstractFunctionDecl *func) const;
 
 public:
     // Caching
@@ -1393,11 +1477,17 @@ public:
 
 void simple_display(llvm::raw_ostream &out, AncestryFlags value);
 
+/// AbstractGenericSignatureRequest and InferredGenericSignatureRequest
+/// return this type, which stores a GenericSignature together with a bit
+/// indicating if there were any errors detected in the original
+/// requirements.
+using GenericSignatureWithError = llvm::PointerIntPair<GenericSignature, 1>;
+
 class AbstractGenericSignatureRequest :
     public SimpleRequest<AbstractGenericSignatureRequest,
-                         GenericSignature (const GenericSignatureImpl *,
-                                           SmallVector<GenericTypeParamType *, 2>,
-                                           SmallVector<Requirement, 2>),
+                         GenericSignatureWithError (const GenericSignatureImpl *,
+                                                    SmallVector<GenericTypeParamType *, 2>,
+                                                    SmallVector<Requirement, 2>),
                          RequestFlags::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -1406,7 +1496,39 @@ private:
   friend SimpleRequest;
 
   // Evaluation.
-  GenericSignature
+  GenericSignatureWithError
+  evaluate(Evaluator &evaluator,
+           const GenericSignatureImpl *baseSignature,
+           SmallVector<GenericTypeParamType *, 2> addedParameters,
+           SmallVector<Requirement, 2> addedRequirements) const;
+
+public:
+  // Separate caching.
+  bool isCached() const { return true; }
+
+  /// Abstract generic signature requests never have source-location info.
+  SourceLoc getNearestLoc() const {
+    return SourceLoc();
+  }
+};
+
+/// Build a generic signature using the RequirementMachine. This is temporary;
+/// once the GenericSignatureBuilder goes away this will be folded into
+/// AbstractGenericSignatureRequest.
+class AbstractGenericSignatureRequestRQM :
+    public SimpleRequest<AbstractGenericSignatureRequestRQM,
+                         GenericSignatureWithError (const GenericSignatureImpl *,
+                                                    SmallVector<GenericTypeParamType *, 2>,
+                                                    SmallVector<Requirement, 2>),
+                         RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  GenericSignatureWithError
   evaluate(Evaluator &evaluator,
            const GenericSignatureImpl *baseSignature,
            SmallVector<GenericTypeParamType *, 2> addedParameters,
@@ -1424,12 +1546,13 @@ public:
 
 class InferredGenericSignatureRequest :
     public SimpleRequest<InferredGenericSignatureRequest,
-                         GenericSignature (ModuleDecl *,
-                                            const GenericSignatureImpl *,
-                                            GenericParamSource,
-                                            SmallVector<Requirement, 2>,
-                                            SmallVector<TypeLoc, 2>,
-                                            bool),
+                         GenericSignatureWithError (ModuleDecl *,
+                                                    const GenericSignatureImpl *,
+                                                    GenericParamList *,
+                                                    WhereClauseOwner,
+                                                    SmallVector<Requirement, 2>,
+                                                    SmallVector<TypeLoc, 2>,
+                                                    bool),
                          RequestFlags::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -1438,11 +1561,12 @@ private:
   friend SimpleRequest;
 
   // Evaluation.
-  GenericSignature
+  GenericSignatureWithError
   evaluate(Evaluator &evaluator,
-           ModuleDecl *module,
+           ModuleDecl *parentModule,
            const GenericSignatureImpl *baseSignature,
-           GenericParamSource paramSource,
+           GenericParamList *genericParams,
+           WhereClauseOwner whereClause,
            SmallVector<Requirement, 2> addedRequirements,
            SmallVector<TypeLoc, 2> inferenceSources,
            bool allowConcreteGenericParams) const;
@@ -1455,7 +1579,50 @@ public:
   SourceLoc getNearestLoc() const {
     return SourceLoc();
   }
-                           
+
+  // Cycle handling.
+  void noteCycleStep(DiagnosticEngine &diags) const;
+};
+
+/// Build a generic signature using the RequirementMachine. This is temporary;
+/// once the GenericSignatureBuilder goes away this will be folded into
+/// InferredGenericSignatureRequest.
+class InferredGenericSignatureRequestRQM :
+    public SimpleRequest<InferredGenericSignatureRequestRQM,
+                         GenericSignatureWithError (ModuleDecl *,
+                                                    const GenericSignatureImpl *,
+                                                    GenericParamList *,
+                                                    WhereClauseOwner,
+                                                    SmallVector<Requirement, 2>,
+                                                    SmallVector<TypeLoc, 2>,
+                                                    bool),
+                         RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  GenericSignatureWithError
+  evaluate(Evaluator &evaluator,
+           ModuleDecl *parentModule,
+           const GenericSignatureImpl *baseSignature,
+           GenericParamList *genericParams,
+           WhereClauseOwner whereClause,
+           SmallVector<Requirement, 2> addedRequirements,
+           SmallVector<TypeLoc, 2> inferenceSources,
+           bool allowConcreteGenericParams) const;
+
+public:
+  // Separate caching.
+  bool isCached() const { return true; }
+
+  /// Inferred generic signature requests don't have source-location info.
+  SourceLoc getNearestLoc() const {
+    return SourceLoc();
+  }
+
   // Cycle handling.
   void noteCycleStep(DiagnosticEngine &diags) const;
 };
@@ -1517,6 +1684,8 @@ public:
   bool isCached() const { return true; }
   Optional<GenericSignature> getCachedResult() const;
   void cacheResult(GenericSignature value) const;
+
+  void diagnoseCycle(DiagnosticEngine &diags) const;
 };
 
 /// Compute the underlying interface type of a typealias.
@@ -1955,24 +2124,6 @@ public:
   bool isCached() const { return true; }
 };
 
-/// Checks whether this type has a distributed actor "local" initializer.
-class HasDistributedActorLocalInitRequest
-    : public SimpleRequest<HasDistributedActorLocalInitRequest, bool(NominalTypeDecl *),
-                           RequestFlags::Cached> {
-public:
-  using SimpleRequest::SimpleRequest;
-
-private:
-  friend SimpleRequest;
-
-  // Evaluation.
-  bool evaluate(Evaluator &evaluator, NominalTypeDecl *decl) const;
-
-public:
-  // Caching.
-  bool isCached() const { return true; }
-};
-
 /// Synthesizes a default initializer for a given type.
 class SynthesizeDefaultInitRequest
     : public SimpleRequest<SynthesizeDefaultInitRequest,
@@ -2064,7 +2215,8 @@ enum class ImplicitMemberAction : uint8_t {
   ResolveEncodable,
   ResolveDecodable,
   ResolveDistributedActor,
-  ResolveDistributedActorAddress,
+  ResolveDistributedActorIdentity,
+  ResolveDistributedActorTransport,
 };
 
 class ResolveImplicitMemberRequest
@@ -2245,6 +2397,24 @@ public:
   void diagnoseCycle(DiagnosticEngine &diags) const;
   void noteCycleStep(DiagnosticEngine &diags) const;
 
+  // Cached.
+  bool isCached() const { return true; }
+};
+
+/// Checks if the _Distributed module is available.
+class DistributedModuleIsAvailableRequest
+    : public SimpleRequest<DistributedModuleIsAvailableRequest, bool(Decl *),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  bool evaluate(Evaluator &evaluator, Decl *decl) const;
+
+public:
   // Cached.
   bool isCached() const { return true; }
 };
@@ -2951,7 +3121,7 @@ public:
 /// the Sendable protocol.
 class GetImplicitSendableRequest :
     public SimpleRequest<GetImplicitSendableRequest,
-                         NormalProtocolConformance *(NominalTypeDecl *),
+                         ProtocolConformance *(NominalTypeDecl *),
                          RequestFlags::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -2959,7 +3129,7 @@ public:
 private:
   friend SimpleRequest;
 
-  NormalProtocolConformance *evaluate(
+  ProtocolConformance *evaluate(
       Evaluator &evaluator, NominalTypeDecl *nominal) const;
 
 public:
@@ -2986,9 +3156,9 @@ public:
   bool isCached() const { return true; }
 };
 
-class AsyncAlternativeRequest
-    : public SimpleRequest<AsyncAlternativeRequest,
-                           AbstractFunctionDecl *(AbstractFunctionDecl *),
+class RenamedDeclRequest
+    : public SimpleRequest<RenamedDeclRequest,
+                           ValueDecl *(const ValueDecl *, const AvailableAttr *),
                            RequestFlags::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -2996,8 +3166,25 @@ public:
 private:
   friend SimpleRequest;
 
-  AbstractFunctionDecl *evaluate(
-      Evaluator &evaluator, AbstractFunctionDecl *attachedFunctionDecl) const;
+  ValueDecl *evaluate(Evaluator &evaluator, const ValueDecl *attached,
+                      const AvailableAttr *attr) const;
+
+public:
+  bool isCached() const { return true; }
+};
+
+class ClosureEffectsRequest
+    : public SimpleRequest<ClosureEffectsRequest,
+                           FunctionType::ExtInfo(ClosureExpr *),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  FunctionType::ExtInfo evaluate(
+      Evaluator &evaluator, ClosureExpr *closure) const;
 
 public:
   bool isCached() const { return true; }

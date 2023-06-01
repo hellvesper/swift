@@ -1,6 +1,6 @@
 // RUN: %empty-directory(%t)
 
-// RUN: %target-swift-frontend -typecheck -swift-version 5 -module-name FeatureTest -emit-module-interface-path - -enable-library-evolution -enable-experimental-concurrency %s | %FileCheck %s
+// RUN: %target-swift-frontend -typecheck -swift-version 5 -module-name FeatureTest -emit-module-interface-path - -enable-library-evolution  -disable-availability-checking %s | %FileCheck %s
 // REQUIRES: concurrency
 
 // REQUIRES: concurrency
@@ -8,6 +8,16 @@
 // Ensure that when we emit a Swift interface that makes use of new features,
 // the uses of those features are guarded by appropriate #if's that allow older
 // compilers to skip over the uses of newer features.
+
+// CHECK: #if compiler(>=5.3) && $SpecializeAttributeWithAvailability
+// CHECK: @_specialize(exported: true, kind: full, availability: macOS, introduced: 12; where T == Swift.Int)
+// CHECK: public func specializeWithAvailability<T>(_ t: T)
+// CHECK: #else
+// CHECK: public func specializeWithAvailability<T>(_ t: T)
+// CHECK: #endif
+@_specialize(exported: true, availability: macOS 12, *; where T == Int)
+public func specializeWithAvailability<T>(_ t: T) {
+}
 
 // CHECK: #if compiler(>=5.3) && $Actors
 // CHECK-NEXT: public actor MyActor

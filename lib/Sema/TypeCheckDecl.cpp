@@ -32,7 +32,6 @@
 #include "swift/AST/Expr.h"
 #include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/GenericEnvironment.h"
-#include "swift/AST/GenericSignatureBuilder.h"
 #include "swift/AST/Initializer.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/OperatorNameLookup.h"
@@ -41,7 +40,6 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeWalker.h"
-#include "swift/Basic/Statistic.h"
 #include "swift/Parse/Lexer.h"
 #include "swift/Parse/Parser.h"
 #include "swift/Sema/IDETypeChecking.h"
@@ -61,12 +59,6 @@
 
 using namespace swift;
 
-#define DEBUG_TYPE "Serialization"
-
-STATISTIC(NumLazyRequirementSignaturesLoaded,
-          "# of lazily-deserialized requirement signatures loaded");
-
-#undef DEBUG_TYPE
 #define DEBUG_TYPE "TypeCheckDecl"
 
 namespace {
@@ -445,14 +437,6 @@ InitKindRequest::evaluate(Evaluator &evaluator, ConstructorDecl *decl) const {
       }
     }
 
-    // the init(transport:) initializer of a distributed actor is special, as
-    // it ties the actors lifecycle with the transport. As such, it must always
-    // be invoked by any other initializer, just like a designated initializer.
-    if (auto clazz = dyn_cast<ClassDecl>(decl->getDeclContext())) {
-      if (clazz->isDistributedActor() && decl->isDistributedActorLocalInit())
-        return CtorInitializerKind::Designated;
-    }
-
     if (decl->getDeclContext()->getExtendedProtocolDecl()) {
       return CtorInitializerKind::Convenience;
     }
@@ -490,14 +474,16 @@ BodyInitKindRequest::evaluate(Evaluator &evaluator,
       if (!apply)
         return { true, E };
 
+      auto *argList = apply->getArgs();
       auto Callee = apply->getSemanticFn();
       
       Expr *arg;
 
       if (isa<OtherConstructorDeclRefExpr>(Callee)) {
-        arg = apply->getArg();
+        arg = argList->getUnaryExpr();
+        assert(arg);
       } else if (auto *CRE = dyn_cast<ConstructorRefCallExpr>(Callee)) {
-        arg = CRE->getArg();
+        arg = CRE->getBase();
       } else if (auto *dotExpr = dyn_cast<UnresolvedDotExpr>(Callee)) {
         if (dotExpr->getName().getBaseName() != DeclBaseName::createConstructor())
           return { true, E };
@@ -681,31 +667,31 @@ ExistentialConformsToSelfRequest::evaluate(Evaluator &evaluator,
 }
 
 bool
-ExistentialTypeSupportedRequest::evaluate(Evaluator &evaluator,
-                                          ProtocolDecl *decl) const {
-  // ObjC protocols can always be existential.
+ExistentialRequiresAnyRequest::evaluate(Evaluator &evaluator,
+                                        ProtocolDecl *decl) const {
+  // ObjC protocols do not require `any`.
   if (decl->isObjC())
-    return true;
+    return false;
 
   for (auto member : decl->getMembers()) {
-    // Existential types cannot be used if the protocol has an associated type.
+    // Existential types require `any` if the protocol has an associated type.
     if (isa<AssociatedTypeDecl>(member))
-      return false;
+      return true;
 
     // For value members, look at their type signatures.
     if (auto valueMember = dyn_cast<ValueDecl>(member)) {
       if (!decl->isAvailableInExistential(valueMember))
-        return false;
+        return true;
     }
   }
 
-  // Check whether all of the inherited protocols support existential types.
+  // Check whether any of the inherited protocols require `any`.
   for (auto proto : decl->getInheritedProtocols()) {
-    if (!proto->existentialTypeSupported())
-      return false;
+    if (proto->existentialRequiresAny())
+      return true;
   }
 
-  return true;
+  return false;
 }
 
 bool
@@ -901,54 +887,6 @@ IsDynamicRequest::evaluate(Evaluator &evaluator, ValueDecl *decl) const {
   }
 
   return false;
-}
-
-ArrayRef<Requirement>
-RequirementSignatureRequest::evaluate(Evaluator &evaluator,
-                                      ProtocolDecl *proto) const {
-  ASTContext &ctx = proto->getASTContext();
-
-  // First check if we have a deserializable requirement signature.
-  if (proto->hasLazyRequirementSignature()) {
-    ++NumLazyRequirementSignaturesLoaded;
-    // FIXME: (transitional) increment the redundant "always-on" counter.
-    if (ctx.Stats)
-      ++ctx.Stats->getFrontendCounters().NumLazyRequirementSignaturesLoaded;
-
-    auto contextData = static_cast<LazyProtocolData *>(
-        ctx.getOrCreateLazyContextData(proto, nullptr));
-
-    SmallVector<Requirement, 8> requirements;
-    contextData->loader->loadRequirementSignature(
-        proto, contextData->requirementSignatureData, requirements);
-    if (requirements.empty())
-      return None;
-    return ctx.AllocateCopy(requirements);
-  }
-
-  GenericSignatureBuilder builder(proto->getASTContext());
-
-  // Add all of the generic parameters.
-  for (auto gp : *proto->getGenericParams())
-    builder.addGenericParameter(gp);
-
-  // Add the conformance of 'self' to the protocol.
-  auto selfType =
-    proto->getSelfInterfaceType()->castTo<GenericTypeParamType>();
-  auto requirement =
-    Requirement(RequirementKind::Conformance, selfType,
-                proto->getDeclaredInterfaceType());
-
-  builder.addRequirement(
-          requirement,
-          GenericSignatureBuilder::RequirementSource::forRequirementSignature(
-                                                      builder, selfType, proto),
-          nullptr);
-
-  auto reqSignature = std::move(builder).computeGenericSignature(
-                        /*allowConcreteGenericParams=*/false,
-                        /*requirementSignatureSelfProto=*/proto);
-  return reqSignature->getRequirements();
 }
 
 Type
@@ -1524,46 +1462,6 @@ TypeChecker::lookupPrecedenceGroup(DeclContext *dc, Identifier name,
   return PrecedenceGroupLookupResult(dc, name, std::move(groups));
 }
 
-static NominalTypeDecl *resolveSingleNominalTypeDecl(
-    DeclContext *DC, SourceLoc loc, Identifier ident, ASTContext &Ctx,
-    TypeResolutionFlags flags = TypeResolutionFlags(0)) {
-  auto *TyR = new (Ctx) SimpleIdentTypeRepr(DeclNameLoc(loc),
-                                            DeclNameRef(ident));
-
-  const auto options =
-      TypeResolutionOptions(TypeResolverContext::TypeAliasDecl) | flags;
-
-  const auto result =
-      TypeResolution::forInterface(DC, options,
-                                   // FIXME: Should unbound generics be allowed
-                                   // to appear amongst designated types?
-                                   /*unboundTyOpener*/ nullptr,
-                                   /*placeholderHandler*/ nullptr)
-          .resolveType(TyR);
-
-  if (result->hasError())
-    return nullptr;
-  return result->getAnyNominal();
-}
-
-bool swift::checkDesignatedTypes(OperatorDecl *OD,
-                                 ArrayRef<Located<Identifier>> identifiers) {
-  auto &ctx = OD->getASTContext();
-  auto *DC = OD->getDeclContext();
-
-  SmallVector<NominalTypeDecl *, 1> designatedNominalTypes;
-  for (auto ident : identifiers) {
-    auto *decl = resolveSingleNominalTypeDecl(DC, ident.Loc, ident.Item, ctx);
-    if (!decl)
-      return true;
-
-    designatedNominalTypes.push_back(decl);
-  }
-
-  OD->setDesignatedNominalTypes(ctx.AllocateCopy(designatedNominalTypes));
-  return false;
-}
-
 /// Validate the given operator declaration.
 ///
 /// This establishes key invariants, such as an InfixOperatorDecl's
@@ -1575,49 +1473,26 @@ OperatorPrecedenceGroupRequest::evaluate(Evaluator &evaluator,
   auto &ctx = IOD->getASTContext();
   auto *dc = IOD->getDeclContext();
 
-  auto enableOperatorDesignatedTypes =
-      ctx.TypeCheckerOpts.EnableOperatorDesignatedTypes;
-
-  PrecedenceGroupDecl *group = nullptr;
-
-  auto identifiers = IOD->getIdentifiers();
-  if (!identifiers.empty()) {
-    auto name = identifiers[0].Item;
-    auto loc = identifiers[0].Loc;
-
-    auto canResolveType = [&]() -> bool {
-      return enableOperatorDesignatedTypes &&
-             resolveSingleNominalTypeDecl(dc, loc, name, ctx,
-                                          TypeResolutionFlags::SilenceErrors);
-    };
-
-    // Make sure not to diagnose in the case where we failed to find a
-    // precedencegroup, but we could resolve a type instead.
+  auto name = IOD->getPrecedenceGroupName();
+  if (!name.empty()) {
+    auto loc = IOD->getPrecedenceGroupLoc();
     auto groups = TypeChecker::lookupPrecedenceGroup(dc, name, loc);
-    if (groups.hasResults() || !canResolveType()) {
-      group = groups.getSingleOrDiagnose(loc);
-      identifiers = identifiers.slice(1);
-    }
+
+    if (groups.hasResults() ||
+        !ctx.TypeCheckerOpts.EnableOperatorDesignatedTypes)
+      return groups.getSingleOrDiagnose(loc);
+
+    // We didn't find the named precedence group and designated types are
+    // enabled, so we will assume that it was actually a designated type. Warn
+    // and fall through as though `PrecedenceGroupName` had never been set.
+    ctx.Diags.diagnose(IOD->getColonLoc(),
+                       diag::operator_decl_remove_designated_types)
+        .fixItRemove({IOD->getColonLoc(), loc});
   }
 
-  // Unless operator designed types are enabled, the parser will ensure that
-  // only one identifier is allowed in the clause, which we should have just
-  // handled.
-  assert(identifiers.empty() || enableOperatorDesignatedTypes);
-
-  if (!group) {
-    auto groups = TypeChecker::lookupPrecedenceGroup(
-        dc, ctx.Id_DefaultPrecedence, SourceLoc());
-    group = groups.getSingleOrDiagnose(IOD->getLoc(), /*forBuiltin*/ true);
-  }
-
-  auto nominalTypes = IOD->getDesignatedNominalTypes();
-  if (nominalTypes.empty() && enableOperatorDesignatedTypes) {
-    if (checkDesignatedTypes(IOD, identifiers)) {
-      IOD->setInvalid();
-    }
-  }
-  return group;
+  auto groups = TypeChecker::lookupPrecedenceGroup(
+      dc, ctx.Id_DefaultPrecedence, SourceLoc());
+  return groups.getSingleOrDiagnose(IOD->getLoc(), /*forBuiltin*/ true);
 }
 
 SelfAccessKind
@@ -2006,7 +1881,7 @@ bool swift::isMemberOperator(FuncDecl *decl, Type type) {
   auto selfNominal = DC->getSelfNominalTypeDecl();
 
   // Check the parameters for a reference to 'Self'.
-  bool isProtocol = selfNominal && isa<ProtocolDecl>(selfNominal);
+  bool isProtocol = isa_and_nonnull<ProtocolDecl>(selfNominal);
   for (auto param : *decl->getParameters()) {
     // Look through a metatype reference, if there is one.
     auto paramType = param->getInterfaceType()->getMetatypeInstanceType();
@@ -2024,6 +1899,14 @@ bool swift::isMemberOperator(FuncDecl *decl, Type type) {
     }
 
     if (isProtocol) {
+      // FIXME: Source compatibility hack for Swift 5. The compiler
+      // accepts member operators on protocols with existential
+      // type arguments. We should consider banning this in Swift 6.
+      if (auto existential = paramType->getAs<ExistentialType>()) {
+        if (selfNominal == existential->getConstraintType()->getAnyNominal())
+          return true;
+      }
+
       // For a protocol, is it the 'Self' type parameter?
       if (auto genericParam = paramType->getAs<GenericTypeParamType>())
         if (genericParam->isEqual(DC->getSelfInterfaceType()))
@@ -2086,6 +1969,13 @@ ResultTypeRequest::evaluate(Evaluator &evaluator, ValueDecl *decl) const {
     resultTyRepr = cast<SubscriptDecl>(decl)->getElementTypeRepr();
   }
 
+  if (!resultTyRepr && decl->getClangDecl() &&
+      isa<clang::FunctionDecl>(decl->getClangDecl())) {
+    auto clangFn = cast<clang::FunctionDecl>(decl->getClangDecl());
+    return ctx.getClangModuleLoader()->importFunctionReturnType(
+        clangFn, decl->getDeclContext());
+  }
+
   // Nothing to do if there's no result type.
   if (resultTyRepr == nullptr)
     return TupleType::getEmpty(ctx);
@@ -2101,8 +1991,9 @@ ResultTypeRequest::evaluate(Evaluator &evaluator, ValueDecl *decl) const {
   const auto options =
       TypeResolutionOptions(TypeResolverContext::FunctionResult);
   auto *const dc = decl->getInnermostDeclContext();
-  return TypeResolution::forInterface(dc, options, /*unboundTyOpener*/ nullptr,
-                                      /*placeholderHandler*/ nullptr)
+  return TypeResolution::forInterface(dc, options,
+                                      /*unboundTyOpener*/ nullptr,
+                                      PlaceholderType::get)
       .resolveType(resultTyRepr);
 }
 
@@ -2186,7 +2077,6 @@ static Type validateParameterType(ParamDecl *decl) {
 
   TypeResolutionOptions options(None);
   OpenUnboundGenericTypeFn unboundTyOpener = nullptr;
-  HandlePlaceholderTypeReprFn placeholderHandler = nullptr;
   if (isa<AbstractClosureExpr>(dc)) {
     options = TypeResolutionOptions(TypeResolverContext::ClosureExpr);
     options |= TypeResolutionFlags::AllowUnspecifiedTypes;
@@ -2197,7 +2087,6 @@ static Type validateParameterType(ParamDecl *decl) {
     };
     // FIXME: Don't let placeholder types escape type resolution.
     // For now, just return the placeholder type.
-    placeholderHandler = PlaceholderType::get;
   } else if (isa<AbstractFunctionDecl>(dc)) {
     options = TypeResolutionOptions(TypeResolverContext::AbstractFunctionDecl);
   } else if (isa<SubscriptDecl>(dc)) {
@@ -2220,7 +2109,7 @@ static Type validateParameterType(ParamDecl *decl) {
 
   const auto resolution =
       TypeResolution::forInterface(dc, options, unboundTyOpener,
-                                   placeholderHandler);
+                                   PlaceholderType::get);
   auto Ty = resolution.resolveType(decl->getTypeRepr());
 
   if (Ty->hasError()) {
@@ -2229,9 +2118,10 @@ static Type validateParameterType(ParamDecl *decl) {
   }
 
   if (decl->isVariadic()) {
-    Ty = TypeChecker::getArraySliceType(decl->getStartLoc(), Ty);
-    if (Ty->hasError()) {
-      decl->setInvalid();
+    Ty = VariadicSequenceType::get(Ty);
+    if (!ctx.getArrayDecl()) {
+      ctx.Diags.diagnose(decl->getTypeRepr()->getLoc(),
+                         diag::sugar_type_not_found, 0);
       return ErrorType::get(ctx);
     }
 
@@ -2706,6 +2596,11 @@ static ArrayRef<Decl *> evaluateMembersRequest(
         (void) var->getPropertyWrapperInitializerInfo();
       }
     }
+
+    // For a distributed function, add the remote function.
+    if (auto *func = dyn_cast<FuncDecl>(member)) {
+      (void) func->getDistributedActorRemoteFuncDecl();
+    }
   }
 
   SortedDeclList synthesizedMembers;
@@ -2766,8 +2661,8 @@ bool TypeChecker::isPassThroughTypealias(TypeAliasDecl *typealias,
   if (!nominalSig) return true;
 
   // Check that the type parameters are the same the whole way through.
-  auto nominalGenericParams = nominalSig->getGenericParams();
-  auto typealiasGenericParams = typealiasSig->getGenericParams();
+  auto nominalGenericParams = nominalSig.getGenericParams();
+  auto typealiasGenericParams = typealiasSig.getGenericParams();
   if (nominalGenericParams.size() != typealiasGenericParams.size())
     return false;
   if (!std::equal(nominalGenericParams.begin(), nominalGenericParams.end(),
@@ -2785,7 +2680,7 @@ bool TypeChecker::isPassThroughTypealias(TypeAliasDecl *typealias,
 
   // If our arguments line up with our innermost generic parameters, it's
   // a passthrough typealias.
-  auto innermostGenericParams = typealiasSig->getInnermostGenericParams();
+  auto innermostGenericParams = typealiasSig.getInnermostGenericParams();
   auto boundArgs = boundGenericType->getGenericArgs();
   if (boundArgs.size() != innermostGenericParams.size())
     return false;

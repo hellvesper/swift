@@ -331,19 +331,23 @@ namespace {
         CanSILFunctionType type, AbstractionPattern origType) {
       auto &M = TC.M;
       auto origTy = type->getWithoutDifferentiability();
-      // Pass the `AbstractionPattern` generic signature to
-      // `SILFunctionType:getAutoDiffDerivativeFunctionType` for correct type
-      // lowering.
+      // Pass the original type of abstraction pattern to
+      // `SILFunctionType:getAutoDiffDerivativeFunctionType` to get the
+      // necessary generic requirements.
+      auto origTypeOfAbstraction =
+          origType.hasGenericSignature() ? origType.getType() : CanType();
       auto jvpTy = origTy->getAutoDiffDerivativeFunctionType(
           type->getDifferentiabilityParameterIndices(),
           type->getDifferentiabilityResultIndices(),
           AutoDiffDerivativeFunctionKind::JVP, TC,
-          LookUpConformanceInModule(&M), CanGenericSignature());
+          LookUpConformanceInModule(&M), CanGenericSignature(),
+          false, origTypeOfAbstraction);
       auto vjpTy = origTy->getAutoDiffDerivativeFunctionType(
           type->getDifferentiabilityParameterIndices(),
           type->getDifferentiabilityResultIndices(),
           AutoDiffDerivativeFunctionKind::VJP, TC,
-          LookUpConformanceInModule(&M), CanGenericSignature());
+          LookUpConformanceInModule(&M), CanGenericSignature(),
+          false, origTypeOfAbstraction);
       RecursiveProperties props;
       props.addSubobject(classifyType(origType, origTy, TC, Expansion));
       props.addSubobject(classifyType(origType, jvpTy, TC, Expansion));
@@ -1768,7 +1772,10 @@ namespace {
         // field type against the declaration's interface type as we normally
         // would, we use the substituted field type in order to accurately
         // preserve the properties of the aggregate.
-        auto origFieldType = origType.unsafeGetSubstFieldType(field);
+        auto sig = field->getDeclContext()->getGenericSignatureOfContext();
+        auto interfaceTy = field->getInterfaceType()->getCanonicalType(sig);
+        auto origFieldType = origType.unsafeGetSubstFieldType(field,
+                                                              interfaceTy);
         
         properties.addSubobject(classifyType(origFieldType, substFieldType,
                                              TC, Expansion));
@@ -2553,6 +2560,32 @@ getFunctionInterfaceTypeWithCaptures(TypeConverter &TC,
       innerExtInfo);
 }
 
+static CanAnyFunctionType getAsyncEntryPoint(ASTContext &C) {
+
+  // @main struct Main {
+  //    static func main() async throws {}
+  //    static func $main() async throws { try await main() }
+  //  }
+  //
+  // func @async_main() async -> Void {
+  //   do {
+  //      try await Main.$main()
+  //      exit(0)
+  //   } catch {
+  //      _emitErrorInMain(error)
+  //   }
+  // }
+  //
+  // This generates the type signature for @async_main
+  // TODO: 'Never' return type would be more accurate.
+
+  CanType returnType = C.getVoidType()->getCanonicalType();
+  FunctionType::ExtInfo extInfo =
+      FunctionType::ExtInfoBuilder().withAsync(true).withThrows(false).build();
+  return CanAnyFunctionType::get(/*genericSig*/ nullptr, {}, returnType,
+                                 extInfo);
+}
+
 static CanAnyFunctionType getEntryPointInterfaceType(ASTContext &C) {
   // Use standard library types if we have them; otherwise, fall back to
   // builtins.
@@ -2598,7 +2631,8 @@ CanAnyFunctionType TypeConverter::makeConstantInterfaceType(SILDeclRef c) {
         makeConstantInterfaceType(c.asAutoDiffOriginalFunction());
     auto *derivativeFnTy = originalFnTy->getAutoDiffDerivativeFunctionType(
         derivativeId->getParameterIndices(), derivativeId->getKind(),
-        LookUpConformanceInModule(&M));
+        LookUpConformanceInModule(&M),
+        derivativeId->getDerivativeGenericSignature());
     return cast<AnyFunctionType>(derivativeFnTy->getCanonicalType());
   }
 
@@ -2666,6 +2700,8 @@ CanAnyFunctionType TypeConverter::makeConstantInterfaceType(SILDeclRef c) {
   case SILDeclRef::Kind::IVarDestroyer:
     return getIVarInitDestroyerInterfaceType(cast<ClassDecl>(vd),
                                              c.isForeign, true);
+  case SILDeclRef::Kind::AsyncEntryPoint:
+    return getAsyncEntryPoint(Context);
   case SILDeclRef::Kind::EntryPoint:
     return getEntryPointInterfaceType(Context);
   }
@@ -2720,6 +2756,7 @@ TypeConverter::getConstantGenericSignature(SILDeclRef c) {
   case SILDeclRef::Kind::StoredPropertyInitializer:
     return vd->getDeclContext()->getGenericSignatureOfContext();
   case SILDeclRef::Kind::EntryPoint:
+  case SILDeclRef::Kind::AsyncEntryPoint:
     llvm_unreachable("Doesn't have generic signature");
   }
 
@@ -2728,9 +2765,7 @@ TypeConverter::getConstantGenericSignature(SILDeclRef c) {
 
 GenericEnvironment *
 TypeConverter::getConstantGenericEnvironment(SILDeclRef c) {
-  if (auto sig = getConstantGenericSignature(c))
-    return sig->getGenericEnvironment();
-  return nullptr;
+  return getConstantGenericSignature(c).getGenericEnvironment();
 }
 
 SILType TypeConverter::getSubstitutedStorageType(TypeExpansionContext context,
@@ -3335,6 +3370,12 @@ TypeConverter::checkFunctionForABIDifferences(SILModule &M,
       return ABIDifference::NeedsThunk;
   }
 
+  // Asynchronous functions require a thunk if they differ in whether they
+  // have an error result.
+  if (fnTy1->hasErrorResult() != fnTy2->hasErrorResult() &&
+      (fnTy1->isAsync() || fnTy2->isAsync()))
+    return ABIDifference::NeedsThunk;
+
   for (unsigned i = 0, e = fnTy1->getParameters().size(); i < e; ++i) {
     auto param1 = fnTy1->getParameters()[i], param2 = fnTy2->getParameters()[i];
     
@@ -3401,18 +3442,18 @@ TypeConverter::getInterfaceBoxTypeForCapture(ValueDecl *captured,
   
   // Instantiate the layout with identity substitutions.
   auto subMap = SubstitutionMap::get(
-    signature,
-    [&](SubstitutableType *type) -> Type {
-      return signature->getCanonicalTypeInContext(type);
-    },
-    MakeAbstractConformanceForGenericType());
+      signature,
+      [&](SubstitutableType *type) -> Type {
+        return signature.getCanonicalTypeInContext(type);
+      },
+      MakeAbstractConformanceForGenericType());
 
   auto boxTy = SILBoxType::get(C, layout, subMap);
 #ifndef NDEBUG
   auto loweredContextType = loweredInterfaceType;
   auto contextBoxTy = boxTy;
   if (signature) {
-    auto env = signature->getGenericEnvironment();
+    auto env = signature.getGenericEnvironment();
     loweredContextType = env->mapTypeIntoContext(loweredContextType)
                             ->getCanonicalType();
     contextBoxTy = cast<SILBoxType>(
@@ -3488,6 +3529,28 @@ CanSILBoxType TypeConverter::getBoxTypeForEnumElement(
 
   auto boxTy = SILBoxType::get(C, layout, subMap);
   return boxTy;
+}
+
+Optional<AbstractionPattern>
+TypeConverter::getConstantAbstractionPattern(SILDeclRef constant) {
+  if (auto closure = constant.getAbstractClosureExpr()) {
+    // Using operator[] here creates an entry in the map if one doesn't exist
+    // yet, marking the fact that the lack of abstraction pattern has been
+    // established and cannot be overridden by `setAbstractionPattern` later.
+    return ClosureAbstractionPatterns[closure];
+  }
+  return None;
+}
+
+void TypeConverter::setAbstractionPattern(AbstractClosureExpr *closure,
+                                          AbstractionPattern pattern) {
+  auto existing = ClosureAbstractionPatterns.find(closure);
+  if (existing != ClosureAbstractionPatterns.end()) {
+    assert(*existing->second == pattern
+     && "closure shouldn't be emitted at different abstraction level contexts");
+  } else {
+    ClosureAbstractionPatterns[closure] = pattern;
+  }
 }
 
 static void countNumberOfInnerFields(unsigned &fieldsCount, TypeConverter &TC,

@@ -14,10 +14,11 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/AST/ASTPrinter.h"
 #include "swift/AST/TypeRepr.h"
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/ASTPrinter.h"
 #include "swift/AST/ASTVisitor.h"
+#include "swift/AST/ASTWalker.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/GenericParamList.h"
 #include "swift/AST/Module.h"
@@ -74,10 +75,32 @@ SourceRange TypeRepr::getSourceRange() const {
   llvm_unreachable("unknown kind!");
 }
 
-/// Standard allocator for TypeReprs.
-void *TypeRepr::operator new(size_t Bytes, const ASTContext &C,
-                             unsigned Alignment) {
-  return C.Allocate(Bytes, Alignment);
+bool TypeRepr::findIf(llvm::function_ref<bool(TypeRepr *)> pred) {
+  struct Walker : ASTWalker {
+    llvm::function_ref<bool(TypeRepr *)> Pred;
+    bool FoundIt;
+
+    explicit Walker(llvm::function_ref<bool(TypeRepr *)> pred)
+        : Pred(pred), FoundIt(false) {}
+
+    bool walkToTypeReprPre(TypeRepr *ty) override {
+      // Returning false skips any child nodes. If we "found it", we can bail by
+      // returning false repeatedly back up the type tree.
+      return !(FoundIt || (FoundIt = Pred(ty)));
+    }
+  };
+
+  Walker walker(pred);
+  walk(walker);
+  return walker.FoundIt;
+}
+
+// TODO [OPAQUE SUPPORT]: We should probably use something like `Type`'s
+// `RecursiveProperties` to track this instead of computing it.
+bool TypeRepr::hasOpaque() {
+  // TODO [OPAQUE SUPPORT]: In the future we will also need to check if `this`
+  // is a `NamedOpaqueReturnTypeRepr`.
+  return findIf([](TypeRepr *ty) { return isa<OpaqueReturnTypeRepr>(ty); });
 }
 
 SourceLoc TypeRepr::findUncheckedAttrLoc() const {
@@ -160,6 +183,8 @@ void AttributedTypeRepr::printAttrs(ASTPrinter &Printer,
     Printer.printSimpleAttr("@autoclosure") << " ";
   if (hasAttr(TAK_escaping))
     Printer.printSimpleAttr("@escaping") << " ";
+  if (hasAttr(TAK_Sendable))
+    Printer.printSimpleAttr("@Sendable") << " ";
   if (hasAttr(TAK_noDerivative))
     Printer.printSimpleAttr("@noDerivative") << " ";
 
@@ -202,6 +227,8 @@ void AttributedTypeRepr::printAttrs(ASTPrinter &Printer,
 
   if (hasAttr(TAK_async))
     Printer.printSimpleAttr("@async") << " ";
+  if (hasAttr(TAK_opened))
+    Printer.printSimpleAttr("@opened") << " ";
 }
 
 IdentTypeRepr *IdentTypeRepr::create(ASTContext &C,
@@ -451,6 +478,12 @@ void ProtocolTypeRepr::printImpl(ASTPrinter &Printer,
 void OpaqueReturnTypeRepr::printImpl(ASTPrinter &Printer,
                                      const PrintOptions &Opts) const {
   Printer.printKeyword("some", Opts, /*Suffix=*/" ");
+  printTypeRepr(Constraint, Printer, Opts);
+}
+
+void ExistentialTypeRepr::printImpl(ASTPrinter &Printer,
+                                    const PrintOptions &Opts) const {
+  Printer.printKeyword("any", Opts, /*Suffix=*/" ");
   printTypeRepr(Constraint, Printer, Opts);
 }
 

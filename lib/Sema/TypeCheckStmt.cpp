@@ -17,6 +17,7 @@
 #include "TypeChecker.h"
 #include "TypeCheckAvailability.h"
 #include "TypeCheckConcurrency.h"
+#include "TypeCheckDistributed.h"
 #include "TypeCheckType.h"
 #include "MiscDiagnostics.h"
 #include "swift/Subsystems.h"
@@ -229,8 +230,7 @@ static void tryDiagnoseUnnecessaryCastOverOptionSet(ASTContext &Ctx,
   if (!optionSetType)
     return;
   SmallVector<ProtocolConformance *, 4> conformances;
-  if (!(optionSetType &&
-        NTD->lookupConformance(module, optionSetType, conformances)))
+  if (!(optionSetType && NTD->lookupConformance(optionSetType, conformances)))
     return;
 
   auto *CE = dyn_cast<CallExpr>(E);
@@ -238,10 +238,10 @@ static void tryDiagnoseUnnecessaryCastOverOptionSet(ASTContext &Ctx,
     return;
   if (!isa<ConstructorRefCallExpr>(CE->getFn()))
     return;
-  auto *ParenE = dyn_cast<ParenExpr>(CE->getArg());
-  if (!ParenE)
+  auto *unaryArg = CE->getArgs()->getUnlabeledUnaryExpr();
+  if (!unaryArg)
     return;
-  auto *ME = dyn_cast<MemberRefExpr>(ParenE->getSubExpr());
+  auto *ME = dyn_cast<MemberRefExpr>(unaryArg);
   if (!ME)
     return;
   ValueDecl *VD = ME->getMember().getDecl();
@@ -365,7 +365,7 @@ static LabeledStmt *findUnlabeledBreakOrContinueStmtTarget(
 ///
 /// \returns the target, if one was found, or \c nullptr if no such target
 /// exists.
-static LabeledStmt *findBreakOrContinueStmtTarget(
+LabeledStmt *swift::findBreakOrContinueStmtTarget(
     ASTContext &ctx, SourceFile *sourceFile,
     SourceLoc loc, Identifier targetName, SourceLoc targetLoc,
     bool isContinue, DeclContext *dc) {
@@ -596,7 +596,7 @@ static void checkFallthroughPatternBindingsAndTypes(
 /// Check the correctness of a 'fallthrough' statement.
 ///
 /// \returns true if an error occurred.
-static bool checkFallthroughStmt(DeclContext *dc, FallthroughStmt *stmt) {
+bool swift::checkFallthroughStmt(DeclContext *dc, FallthroughStmt *stmt) {
   CaseStmt *fallthroughSource;
   CaseStmt *fallthroughDest;
   ASTContext &ctx = dc->getASTContext();
@@ -855,10 +855,11 @@ public:
     // Coerce the operand to the exception type.
     auto E = TS->getSubExpr();
 
-    Type exnType = getASTContext().getErrorDecl()->getDeclaredInterfaceType();
-    if (!exnType) return TS;
+    if (!getASTContext().getErrorDecl())
+      return TS;
 
-    TypeChecker::typeCheckExpression(E, DC, {exnType, CTP_ThrowStmt});
+    Type errorType = getASTContext().getErrorExistentialType();
+    TypeChecker::typeCheckExpression(E, DC, {errorType, CTP_ThrowStmt});
     TS->setSubExpr(E);
 
     return TS;
@@ -1205,7 +1206,7 @@ public:
     auto catches = S->getCatches();
     checkSiblingCaseStmts(catches.begin(), catches.end(),
                           CaseParentKind::DoCatch, limitExhaustivityChecks,
-                          getASTContext().getExceptionType());
+                          getASTContext().getErrorExistentialType());
 
     return S;
   }
@@ -1233,6 +1234,7 @@ static void diagnoseIgnoredLiteral(ASTContext &Ctx, LiteralExpr *LE) {
     case ExprKind::BooleanLiteral: return "boolean";
     case ExprKind::StringLiteral: return "string";
     case ExprKind::InterpolatedStringLiteral: return "string";
+    case ExprKind::RegexLiteral: return "regular expression";
     case ExprKind::MagicIdentifierLiteral:
       return MagicIdentifierLiteralExpr::getKindString(
           cast<MagicIdentifierLiteralExpr>(LE)->getKind());
@@ -1257,16 +1259,6 @@ static void diagnoseIgnoredLiteral(ASTContext &Ctx, LiteralExpr *LE) {
 }
 
 void TypeChecker::checkIgnoredExpr(Expr *E) {
-  // For parity with C, several places in the grammar accept multiple
-  // comma-separated expressions and then bind them together as an implicit
-  // tuple.  Break these apart and check them separately.
-  if (E->isImplicit() && isa<TupleExpr>(E)) {
-    for (auto Elt : cast<TupleExpr>(E)->getElements()) {
-      checkIgnoredExpr(Elt);
-    }
-    return;
-  }
-
   // Skip checking if there is no type, which presumably means there was a
   // type error.
   if (!E->getType()) {
@@ -1431,29 +1423,15 @@ void TypeChecker::checkIgnoredExpr(Expr *E) {
 
     // Otherwise, complain.  Start with more specific diagnostics.
 
-    // Diagnose unused literals that were translated to implicit
-    // constructor calls during CSApply / ExprRewriter::convertLiteral.
-    if (call->isImplicit()) {
-      Expr *arg = call->getArg();
-      if (auto *TE = dyn_cast<TupleExpr>(arg))
-        if (TE->getNumElements() == 1)
-          arg = TE->getElement(0);
-
-      if (auto *LE = dyn_cast<LiteralExpr>(arg)) {
-        diagnoseIgnoredLiteral(Context, LE);
-        return;
-      }
-    }
-
-    // Other unused constructor calls.
-    if (callee && isa<ConstructorDecl>(callee) && !call->isImplicit()) {
+    // Diagnose unused constructor calls.
+    if (isa_and_nonnull<ConstructorDecl>(callee) && !call->isImplicit()) {
       DE.diagnose(fn->getLoc(), diag::expression_unused_init_result,
                callee->getDeclContext()->getDeclaredInterfaceType())
-        .highlight(call->getArg()->getSourceRange());
+        .highlight(call->getArgs()->getSourceRange());
       return;
     }
     
-    SourceRange SR1 = call->getArg()->getSourceRange(), SR2;
+    SourceRange SR1 = call->getArgs()->getSourceRange(), SR2;
     if (auto *BO = dyn_cast<BinaryExpr>(call)) {
       SR1 = BO->getLHS()->getSourceRange();
       SR2 = BO->getRHS()->getSourceRange();
@@ -1538,7 +1516,7 @@ void StmtChecker::typeCheckASTNode(ASTNode &node) {
 
   // Type check the declaration.
   if (auto *D = node.dyn_cast<Decl *>()) {
-    TypeChecker::typeCheckDecl(D);
+    TypeChecker::typeCheckDecl(D, LeaveBraceStmtBodyUnchecked);
     return;
   }
 
@@ -1605,7 +1583,7 @@ static Expr* constructCallToSuperInit(ConstructorDecl *ctor,
                                               SourceLoc(), /*Implicit=*/true);
   Expr *r = UnresolvedDotExpr::createImplicit(
       Context, superRef, DeclBaseName::createConstructor());
-  r = CallExpr::createImplicit(Context, r, { }, { });
+  r = CallExpr::createImplicitEmpty(Context, r);
 
   if (ctor->hasThrows())
     r = new (Context) TryExpr(SourceLoc(), r, Type(), /*implicit=*/true);
@@ -1637,7 +1615,7 @@ static bool checkSuperInit(ConstructorDecl *fromCtor,
       if (auto classTy = selfTy->getClassOrBoundGenericClass()) {
         assert(classTy->getSuperclass());
         auto &Diags = fromCtor->getASTContext().Diags;
-        Diags.diagnose(apply->getArg()->getLoc(), diag::chain_convenience_init,
+        Diags.diagnose(apply->getArgs()->getLoc(), diag::chain_convenience_init,
                        classTy->getSuperclass());
         ctor->diagnose(diag::convenience_init_here);
       }
@@ -1752,9 +1730,6 @@ static void checkClassConstructorBody(ClassDecl *classDecl,
 
     ctx.Diags.diagnose(initKindAndExpr.initExpr->getLoc(), diag::delegation_here);
   }
-
-  if (classDecl->isActor())
-    checkActorConstructorBody(classDecl, ctor, body);
 
   // An inlinable constructor in a class must always be delegating,
   // unless the class is '@_fixed_layout'.
@@ -1982,6 +1957,10 @@ TypeCheckFunctionBodyRequest::evaluate(Evaluator &evaluator,
   if (tyOpts.DebugTimeFunctionBodies || tyOpts.WarnLongFunctionBodies)
     timer.emplace(AFD);
 
+  auto SF = AFD->getParentSourceFile();
+  if (SF)
+    TypeChecker::buildTypeRefinementContextHierarchyDelayed(*SF, AFD);
+
   BraceStmt *body = AFD->getBody();
   assert(body && "Expected body to type-check");
 
@@ -2066,7 +2045,6 @@ TypeCheckFunctionBodyRequest::evaluate(Evaluator &evaluator,
   // Class constructor checking.
   if (auto *ctor = dyn_cast<ConstructorDecl>(AFD)) {
     if (auto classDecl = ctor->getDeclContext()->getSelfClassDecl()) {
-      checkActorConstructor(classDecl, ctor);
       checkClassConstructorBody(classDecl, ctor, body);
     }
   }

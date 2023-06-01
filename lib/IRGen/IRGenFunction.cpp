@@ -22,6 +22,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/BinaryFormat/MachO.h"
 
 #include "Callee.h"
 #include "Explosion.h"
@@ -289,6 +290,35 @@ void IRGenFunction::emitTSanInoutAccessCall(llvm::Value *address) {
   Builder.CreateCall(fn, {castAddress, callerPC, castTag});
 }
 
+// This is shamelessly copied from clang's codegen. We need to get the clang
+// functionality into a shared header so that platforms only
+// needs to be updated in one place.
+static unsigned getBaseMachOPlatformID(const llvm::Triple &TT) {
+  switch (TT.getOS()) {
+  case llvm::Triple::Darwin:
+  case llvm::Triple::MacOSX:
+    return llvm::MachO::PLATFORM_MACOS;
+  case llvm::Triple::IOS:
+    return llvm::MachO::PLATFORM_IOS;
+  case llvm::Triple::TvOS:
+    return llvm::MachO::PLATFORM_TVOS;
+  case llvm::Triple::WatchOS:
+    return llvm::MachO::PLATFORM_WATCHOS;
+  default:
+    return /*Unknown platform*/ 0;
+  }
+}
+
+llvm::Value *
+IRGenFunction::emitTargetOSVersionAtLeastCall(llvm::Value *major,
+                                              llvm::Value *minor,
+                                              llvm::Value *patch) {
+  auto *fn = cast<llvm::Function>(IGM.getPlatformVersionAtLeastFn());
+
+  llvm::Value *platformID =
+    llvm::ConstantInt::get(IGM.Int32Ty, getBaseMachOPlatformID(IGM.Triple));
+  return Builder.CreateCall(fn, {platformID, major, minor, patch});
+}
 
 /// Initialize a relative indirectable pointer to the given value.
 /// This always leaves the value in the direct state; if it's not a
@@ -446,7 +476,9 @@ Address IRGenFunction::emitAddressAtOffset(llvm::Value *base, Offset offset,
       auto scaledIndex =
         int64_t(byteOffset.getValue()) / int64_t(objectSize.getValue());
       auto indexValue = IGM.getSize(Size(scaledIndex));
-      auto slotPtr = Builder.CreateInBoundsGEP(base, indexValue);
+      auto slotPtr = Builder.CreateInBoundsGEP(
+          base->getType()->getScalarType()->getPointerElementType(), base,
+          indexValue);
 
       return Address(slotPtr, objectAlignment);
     }
@@ -658,6 +690,17 @@ void IRGenFunction::emitGetAsyncContinuation(SILType resumeTy,
   out.add(unsafeContinuation);
 }
 
+static bool shouldUseContinuationAwait(IRGenModule &IGM) {
+  auto &ctx = IGM.Context;
+  auto module = ctx.getLoadedModule(ctx.Id_Concurrency);
+  assert(module && "building async code without concurrency library");
+  SmallVector<ValueDecl *, 1> results;
+  module->lookupValue(ctx.getIdentifier("_abiEnableAwaitContinuation"),
+                      NLKind::UnqualifiedLookup, results);
+  assert(results.size() <= 1);
+  return !results.empty();
+}
+
 void IRGenFunction::emitAwaitAsyncContinuation(
     SILType resumeTy, bool isIndirectResult,
     Explosion &outDirectResult, llvm::BasicBlock *&normalBB,
@@ -665,50 +708,48 @@ void IRGenFunction::emitAwaitAsyncContinuation(
   assert(AsyncCoroutineCurrentContinuationContext && "no active continuation");
   auto pointerAlignment = IGM.getPointerAlignment();
 
-  // Check whether the continuation has already been resumed.
-  // If so, we can just immediately continue with the control flow.
-  // Otherwise, we need to suspend, and resuming the continuation will
-  // trigger the function to resume.
-  //
-  // We do this by atomically trying to change the synchronization field
-  // in the continuation context from 0 (the state it was initialized
-  // with) to 1.  If this fails, the continuation must already have been
-  // resumed, so we can bypass the suspension point and immediately
-  // start interpreting the result stored in the continuation.
-  // Note that we use a strong compare-exchange (the default for the LLVM
-  // cmpxchg instruction), so spurious failures are disallowed; we can
-  // therefore trust that a failure means that the continuation has
-  // already been resumed.
+  // Call swift_continuation_await to check whether the continuation
+  // has already been resumed.
+  bool useContinuationAwait = shouldUseContinuationAwait(IGM);
 
-  auto contAwaitSyncAddr =
-      Builder.CreateStructGEP(AsyncCoroutineCurrentContinuationContext, 1);
+  // As a temporary hack for compatibility with SDKs that don't provide
+  // swift_continuation_await, emit the old inline sequence.  This can
+  // be removed as soon as we're sure that such SDKs don't exist.
+  if (!useContinuationAwait) {
+    auto contAwaitSyncAddr = Builder.CreateStructGEP(
+        AsyncCoroutineCurrentContinuationContext->getType()
+            ->getScalarType()
+            ->getPointerElementType(),
+        AsyncCoroutineCurrentContinuationContext, 1);
 
-  auto pendingV = llvm::ConstantInt::get(
-      contAwaitSyncAddr->getType()->getPointerElementType(),
-      unsigned(ContinuationStatus::Pending));
-  auto awaitedV = llvm::ConstantInt::get(
-      contAwaitSyncAddr->getType()->getPointerElementType(),
-      unsigned(ContinuationStatus::Awaited));
-  auto results = Builder.CreateAtomicCmpXchg(
-      contAwaitSyncAddr, pendingV, awaitedV,
-      llvm::AtomicOrdering::Release /*success ordering*/,
-      llvm::AtomicOrdering::Acquire /* failure ordering */,
-      llvm::SyncScope::System);
-  auto firstAtAwait = Builder.CreateExtractValue(results, 1);
-  auto contBB = createBasicBlock("await.async.resume");
-  auto abortBB = createBasicBlock("await.async.abort");
-  Builder.CreateCondBr(firstAtAwait, abortBB, contBB);
-  Builder.emitBlock(abortBB);
-  {
-    // We were the first to the sync point. "Abort" (return from the
-    // coroutine partial function, without making a tail call to anything)
-    // because the continuation result is not available yet. When the
-    // continuation is later resumed, the task will get scheduled
-    // starting from the suspension point.
-    emitCoroutineOrAsyncExit();
+    auto pendingV = llvm::ConstantInt::get(
+        contAwaitSyncAddr->getType()->getPointerElementType(),
+        unsigned(ContinuationStatus::Pending));
+    auto awaitedV = llvm::ConstantInt::get(
+        contAwaitSyncAddr->getType()->getPointerElementType(),
+        unsigned(ContinuationStatus::Awaited));
+    auto results = Builder.CreateAtomicCmpXchg(
+        contAwaitSyncAddr, pendingV, awaitedV, llvm::MaybeAlign(),
+        llvm::AtomicOrdering::Release /*success ordering*/,
+        llvm::AtomicOrdering::Acquire /* failure ordering */,
+        llvm::SyncScope::System);
+    auto firstAtAwait = Builder.CreateExtractValue(results, 1);
+    auto contBB = createBasicBlock("await.async.resume");
+    auto abortBB = createBasicBlock("await.async.abort");
+    Builder.CreateCondBr(firstAtAwait, abortBB, contBB);
+    Builder.emitBlock(abortBB);
+    {
+      // We were the first to the sync point. "Abort" (return from the
+      // coroutine partial function, without making a tail call to anything)
+      // because the continuation result is not available yet. When the
+      // continuation is later resumed, the task will get scheduled
+      // starting from the suspension point.
+      emitCoroutineOrAsyncExit();
+    }
+
+    Builder.emitBlock(contBB);
   }
 
-  Builder.emitBlock(contBB);
   {
     // Set up the suspend point.
     SmallVector<llvm::Value *, 8> arguments;
@@ -718,15 +759,26 @@ void IRGenFunction::emitAwaitAsyncContinuation(
     auto resumeProjFn = getOrCreateResumePrjFn();
     arguments.push_back(
         Builder.CreateBitOrPointerCast(resumeProjFn, IGM.Int8PtrTy));
-    // The dispatch function just calls the resume point.
-    auto resumeFnPtr =
+
+    llvm::Constant *awaitFnPtr;
+    if (useContinuationAwait) {
+      awaitFnPtr = IGM.getAwaitAsyncContinuationFn();
+    } else {
+      auto resumeFnPtr =
         getFunctionPointerForResumeIntrinsic(AsyncCoroutineCurrentResume);
-    arguments.push_back(Builder.CreateBitOrPointerCast(
-        createAsyncDispatchFn(resumeFnPtr, {IGM.Int8PtrTy}),
-        IGM.Int8PtrTy));
-    arguments.push_back(AsyncCoroutineCurrentResume);
-    arguments.push_back(Builder.CreateBitOrPointerCast(
+      awaitFnPtr = createAsyncDispatchFn(resumeFnPtr, {IGM.Int8PtrTy});
+    }
+    arguments.push_back(
+        Builder.CreateBitOrPointerCast(awaitFnPtr, IGM.Int8PtrTy));
+
+    if (useContinuationAwait) {
+      arguments.push_back(AsyncCoroutineCurrentContinuationContext);
+    } else {
+      arguments.push_back(AsyncCoroutineCurrentResume);
+      arguments.push_back(Builder.CreateBitOrPointerCast(
         AsyncCoroutineCurrentContinuationContext, IGM.Int8PtrTy));
+    }
+
     auto resultTy =
         llvm::StructType::get(IGM.getLLVMContext(), {IGM.Int8PtrTy}, false /*packed*/);
     emitSuspendAsyncCall(swiftAsyncContextIndex, resultTy, arguments);
@@ -737,9 +789,13 @@ void IRGenFunction::emitAwaitAsyncContinuation(
   // to the error destination.
   if (optionalErrorBB) {
     auto normalContBB = createBasicBlock("await.async.normal");
-    auto contErrResultAddr = Address(
-        Builder.CreateStructGEP(AsyncCoroutineCurrentContinuationContext, 2),
-        pointerAlignment);
+    auto contErrResultAddr =
+        Address(Builder.CreateStructGEP(
+                    AsyncCoroutineCurrentContinuationContext->getType()
+                        ->getScalarType()
+                        ->getPointerElementType(),
+                    AsyncCoroutineCurrentContinuationContext, 2),
+                pointerAlignment);
     auto errorRes = Builder.CreateLoad(contErrResultAddr);
     auto nullError = llvm::Constant::getNullValue(errorRes->getType());
     auto hasError = Builder.CreateICmpNE(errorRes, nullError);
@@ -752,8 +808,11 @@ void IRGenFunction::emitAwaitAsyncContinuation(
   // result slot, load from the temporary we created during
   // get_async_continuation.
   if (!isIndirectResult) {
-    auto contResultAddrAddr =
-        Builder.CreateStructGEP(AsyncCoroutineCurrentContinuationContext, 3);
+    auto contResultAddrAddr = Builder.CreateStructGEP(
+        AsyncCoroutineCurrentContinuationContext->getType()
+            ->getScalarType()
+            ->getPointerElementType(),
+        AsyncCoroutineCurrentContinuationContext, 3);
     auto resultAddrVal =
         Builder.CreateLoad(Address(contResultAddrAddr, pointerAlignment));
     // Take the result.

@@ -24,7 +24,6 @@
 #include "swift/Reflection/TypeLowering.h"
 #include "swift/Reflection/TypeRef.h"
 #include "llvm/ADT/Optional.h"
-
 #include <vector>
 #include <unordered_map>
 
@@ -289,8 +288,8 @@ public:
 
   void clearNodeFactory() { Dem.clear(); }
 
-  BuiltType decodeMangledType(Node *node);
-  
+  BuiltType decodeMangledType(Node *node, bool forRequirement = true);
+
   ///
   /// Factory methods for all TypeRef kinds
   ///
@@ -301,12 +300,20 @@ public:
   }
 
   llvm::Optional<std::string> createTypeDecl(Node *node, bool &typeAlias) {
-    return Demangle::mangleNode(node);
+    auto mangling = Demangle::mangleNode(node);
+    if (!mangling.isSuccess()) {
+      return llvm::None;
+    }
+    return mangling.result();
   }
 
   BuiltProtocolDecl
   createProtocolDecl(Node *node) {
-    return std::make_pair(Demangle::mangleNode(node), false);
+    auto mangling = Demangle::mangleNode(node);
+    if (!mangling.isSuccess()) {
+      return llvm::None;
+    }
+    return std::make_pair(mangling.result(), false);
   }
 
   BuiltProtocolDecl
@@ -396,12 +403,16 @@ public:
       
       return underlyingTy->subst(*this, subs);
     }
-    
+
+    auto mangling = mangleNode(opaqueDescriptor,
+                               SymbolicResolver(),
+                               Dem);
+    if (!mangling.isSuccess())
+      return nullptr;
+
     // Otherwise, build a type ref that represents the opaque type.
     return OpaqueArchetypeTypeRef::create(*this,
-                                          mangleNode(opaqueDescriptor,
-                                                     SymbolicResolver(),
-                                                     Dem),
+                                          mangling.result(),
                                           nodeToString(opaqueDescriptor),
                                           ordinal,
                                           genericArgs);
@@ -480,7 +491,8 @@ public:
 
   const ProtocolCompositionTypeRef *
   createProtocolCompositionType(llvm::ArrayRef<BuiltProtocolDecl> protocols,
-                                BuiltType superclass, bool isClassBound) {
+                                BuiltType superclass, bool isClassBound,
+                                bool forRequirement = true) {
     std::vector<const TypeRef *> protocolRefs;
     for (const auto &protocol : protocols) {
       if (!protocol)
@@ -632,6 +644,10 @@ public:
 
 private:
   std::vector<ReflectionInfo> ReflectionInfos;
+
+  /// Index of the next Reflection Info that should be processed.
+  /// This assumes that Reflection Infos are never removed from the vector.
+  size_t FirstUnprocessedReflectionInfoIndex = 0;
     
   llvm::Optional<std::string> normalizeReflectionName(RemoteRef<char> name);
   bool reflectionNameMatches(RemoteRef<char> reflectionName,

@@ -253,6 +253,8 @@ SYNTAX_NODE_SERIALIZATION_CODES = {
     'TargetFunctionEntry': 248,
     'PostfixIfConfigExpr': 250,
     'UnavailabilityCondition': 251,
+    'AvailabilityEntry' : 252,
+    'RegexLiteralExpr': 253,
 }
 
 

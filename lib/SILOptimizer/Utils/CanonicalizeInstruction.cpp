@@ -33,12 +33,7 @@
 
 using namespace swift;
 
-// STATISTIC uses the default DEBUG_TYPE.
-#define DEBUG_TYPE CanonicalizeInstruction::defaultDebugType
-STATISTIC(NumSimplified, "Number of instructions simplified");
-
 // Tracing within the implementation can also be activiated by the pass.
-#undef DEBUG_TYPE
 #define DEBUG_TYPE pass.debugType
 
 // Vtable anchor.
@@ -420,8 +415,8 @@ broadenSingleElementStores(StoreInst *storeInst,
 /// borrow scope--copy/destroy is insufficient by itself.
 ///
 /// FIXME: Technically this should be guarded by a compiler flag like
-/// -enable-copy-propagation until SILGen protects scoped variables by borrow
-/// scopes.
+/// -enable-copy-propagation until SILGen protects scoped variables by
+/// borrow scopes.
 static SILBasicBlock::iterator
 eliminateSimpleCopies(CopyValueInst *cvi, CanonicalizeInstruction &pass) {
   auto next = std::next(cvi->getIterator());
@@ -449,6 +444,15 @@ eliminateSimpleCopies(CopyValueInst *cvi, CanonicalizeInstruction &pass) {
 static SILBasicBlock::iterator
 eliminateSimpleBorrows(BeginBorrowInst *bbi, CanonicalizeInstruction &pass) {
   auto next = std::next(bbi->getIterator());
+
+  // Lexical borrow scopes can only be eliminated under certain circumstances:
+  // (1) They can never be eliminated if the module is in the raw stage, because
+  //     they may be needed for diagnostic.
+  // (2) They can never be eliminated if there is no enclosing lexical scope
+  //     which guarantees the lifetime of the value.
+  if (bbi->isLexical() && (bbi->getModule().getStage() == SILStage::Raw ||
+                           !isNestedLexicalBeginBorrow(bbi)))
+    return next;
 
   // We know that our borrow is completely within the lifetime of its base value
   // if the borrow is never reborrowed. We check for reborrows and do not

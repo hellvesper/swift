@@ -17,10 +17,12 @@
 #ifndef SWIFT_AST_ASTCONTEXT_H
 #define SWIFT_AST_ASTCONTEXT_H
 
+#include "swift/AST/ASTAllocated.h"
 #include "swift/AST/Evaluator.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/Identifier.h"
 #include "swift/AST/Import.h"
+#include "swift/AST/SILOptions.h"
 #include "swift/AST/SearchPathOptions.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/TypeAlignments.h"
@@ -38,6 +40,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/DataTypes.h"
@@ -105,6 +108,8 @@ namespace swift {
   class InheritedProtocolConformance;
   class SelfProtocolConformance;
   class SpecializedProtocolConformance;
+  enum class BuiltinConformanceKind;
+  class BuiltinProtocolConformance;
   enum class ProtocolConformanceState;
   class Pattern;
   enum PointerTypeKind : unsigned;
@@ -112,7 +117,6 @@ namespace swift {
   class TupleTypeElt;
   class EnumElementDecl;
   class ProtocolDecl;
-  class RequirementMachine;
   class SubstitutableType;
   class SourceManager;
   class ValueDecl;
@@ -135,25 +139,13 @@ namespace namelookup {
   class ImportCache;
 }
 
+namespace rewriting {
+  class RewriteContext;
+}
+
 namespace syntax {
   class SyntaxArena;
 }
-
-/// The arena in which a particular ASTContext allocation will go.
-enum class AllocationArena {
-  /// The permanent arena, which is tied to the lifetime of
-  /// the ASTContext.
-  ///
-  /// All global declarations and types need to be allocated into this arena.
-  /// At present, everything that is not a type involving a type variable is
-  /// allocated in this arena.
-  Permanent,
-  /// The constraint solver's temporary arena, which is tied to the
-  /// lifetime of a particular instance of the constraint solver.
-  ///
-  /// Any type involving a type variable is allocated in this arena.
-  ConstraintSolver
-};
 
 /// Lists the set of "known" Foundation entities that are used in the
 /// compiler.
@@ -230,11 +222,10 @@ class ASTContext final {
   void operator=(const ASTContext&) = delete;
 
   ASTContext(LangOptions &langOpts, TypeCheckerOptions &typeckOpts,
-             SearchPathOptions &SearchPathOpts,
+             SILOptions &silOpts, SearchPathOptions &SearchPathOpts,
              ClangImporterOptions &ClangImporterOpts,
              symbolgraphgen::SymbolGraphOptions &SymbolGraphOpts,
-             SourceManager &SourceMgr,
-             DiagnosticEngine &Diags);
+             SourceManager &SourceMgr, DiagnosticEngine &Diags);
 
 public:
   // Members that should only be used by ASTContext.cpp.
@@ -246,7 +237,7 @@ public:
   void operator delete(void *Data) throw();
 
   static ASTContext *get(LangOptions &langOpts, TypeCheckerOptions &typeckOpts,
-                         SearchPathOptions &SearchPathOpts,
+                         SILOptions &silOpts, SearchPathOptions &SearchPathOpts,
                          ClangImporterOptions &ClangImporterOpts,
                          symbolgraphgen::SymbolGraphOptions &SymbolGraphOpts,
                          SourceManager &SourceMgr, DiagnosticEngine &Diags);
@@ -264,6 +255,9 @@ public:
   /// The type checker options.
   const TypeCheckerOptions &TypeCheckerOpts;
 
+  /// Options for SIL.
+  const SILOptions &SILOpts;
+
   /// The search path options used by this AST context.
   SearchPathOptions &SearchPathOpts;
 
@@ -278,6 +272,15 @@ public:
 
   /// Diags - The diagnostics engine.
   DiagnosticEngine &Diags;
+
+  /// If the shared pointer is not a \c nullptr and the pointee is \c true,
+  /// all operations working on this ASTContext should be aborted at the next
+  /// possible opportunity.
+  /// This is used by SourceKit to cancel requests for which the result is no
+  /// longer of interest.
+  /// The returned result will be discarded, so the operation that acknowledges
+  /// the cancellation might return with any result.
+  std::shared_ptr<std::atomic<bool>> CancellationFlag = nullptr;
 
   TypeCheckCompletionCallback *CompletionCallback = nullptr;
 
@@ -356,6 +359,15 @@ private:
   /// Cache of module names that fail the 'canImport' test in this context.
   mutable llvm::SmallPtrSet<Identifier, 8> FailedModuleImportNames;
   
+  /// Set if a `-module-alias` was passed. Used to store mapping between module aliases and
+  /// their corresponding real names, and vice versa for a reverse lookup, which is needed to check
+  /// if the module names appearing in source files are aliases or real names.
+  /// \see ASTContext::getRealModuleName.
+  ///
+  /// The boolean in the value indicates whether or not the entry is keyed by an alias vs real name,
+  /// i.e. true if the entry is [key: alias_name, value: (real_name, true)].
+  mutable llvm::DenseMap<Identifier, std::pair<Identifier, bool>> ModuleAliasMap;
+
   /// Retrieve the allocator for the given arena.
   llvm::BumpPtrAllocator &
   getAllocator(AllocationArena arena = AllocationArena::Permanent) const;
@@ -480,13 +492,41 @@ public:
   /// specified string.
   Identifier getIdentifier(StringRef Str) const;
 
+  /// Convert a given alias map to a map of Identifiers between module aliases and their actual names.
+  /// For example, if '-module-alias Foo=X -module-alias Bar=Y' input is passed in, the aliases Foo and Bar are
+  /// the names of the imported or referenced modules in source files in the main module, and X and Y
+  /// are the real (physical) module names on disk.
+  void setModuleAliases(const llvm::StringMap<StringRef> &aliasMap);
+
+  /// Look up option used in \c getRealModuleName when module aliasing is applied.
+  enum class ModuleAliasLookupOption {
+    alwaysRealName,
+    realNameFromAlias,
+    aliasFromRealName
+  };
+
+  /// Look up the module alias map by the given \p key and a lookup \p option.
+  ///
+  /// \param key A module alias or real name to look up the map by.
+  /// \param option A look up option \c ModuleAliasLookupOption. Defaults to alwaysRealName.
+  ///
+  /// \return The real name or alias mapped to the key.
+  ///         If no aliasing is used, return \p key regardless of \p option.
+  ///         If \p option is alwaysRealName, return the real module name whether the \p key is an alias
+  ///         or a real name.
+  ///         If \p option is realNameFromAlias, only return a real name if \p key is an alias.
+  ///         If \p option is aliasFromRealName, only return an alias if \p key is a real name.
+  ///         Else return a real name or an alias mapped to the \p key.
+  Identifier getRealModuleName(Identifier key,
+                               ModuleAliasLookupOption option = ModuleAliasLookupOption::alwaysRealName) const;
+
   /// Decide how to interpret two precedence groups.
   Associativity associateInfixOperators(PrecedenceGroupDecl *left,
                                         PrecedenceGroupDecl *right) const;
 
   /// Retrieve the declaration of Swift.Error.
   ProtocolDecl *getErrorDecl() const;
-  CanType getExceptionType() const;
+  CanType getErrorExistentialType() const;
   
 #define KNOWN_STDLIB_TYPE_DECL(NAME, DECL_CLASS, NUM_GENERIC_PARAMS) \
   /** Retrieve the declaration of Swift.NAME. */ \
@@ -747,12 +787,19 @@ public:
   /// Get the runtime availability of support for concurrency.
   AvailabilityContext getConcurrencyAvailability();
 
+  /// Get the back-deployed availability for concurrency.
+  AvailabilityContext getBackDeployedConcurrencyAvailability();
+
   /// Get the runtime availability of support for differentiation.
   AvailabilityContext getDifferentiationAvailability();
 
   /// Get the runtime availability of getters and setters of multi payload enum
   /// tag single payloads.
   AvailabilityContext getMultiPayloadEnumTagSinglePayload();
+
+  /// Get the runtime availability of the Objective-C enabled
+  /// swift_isUniquelyReferenced functions.
+  AvailabilityContext getObjCIsUniquelyReferencedAvailability();
 
   /// Get the runtime availability of features introduced in the Swift 5.2
   /// compiler for the target platform.
@@ -773,6 +820,11 @@ public:
   /// Get the runtime availability of features introduced in the Swift 5.6
   /// compiler for the target platform.
   AvailabilityContext getSwift56Availability();
+
+  // Note: Update this function if you add a new getSwiftXYAvailability above.
+  /// Get the runtime availability for a particular version of Swift (5.0+).
+  AvailabilityContext
+  getSwift5PlusAvailability(llvm::VersionTuple swiftVersion);
 
   /// Get the runtime availability of features that have been introduced in the
   /// Swift compiler for future versions of the target platform.
@@ -849,6 +901,13 @@ public:
       StringRef moduleName,
       ModuleDependenciesCache &cache,
       InterfaceSubContextDelegate &delegate);
+
+  /// Compute the extra implicit framework search paths on Apple platforms:
+  /// $SDKROOT/System/Library/Frameworks/ and $SDKROOT/Library/Frameworks/.
+  std::vector<std::string> getDarwinImplicitFrameworkSearchPaths() const;
+
+  /// Return a set of all possible filesystem locations where modules can be found.
+  llvm::StringSet<> getAllModuleSearchPathsSet() const;
 
   /// Load extensions to the given nominal type from the external
   /// module loaders.
@@ -1026,6 +1085,13 @@ public:
   SelfProtocolConformance *
   getSelfConformance(ProtocolDecl *protocol);
 
+  /// Produce the builtin conformance for some structural type to some protocol.
+  BuiltinProtocolConformance *
+  getBuiltinConformance(Type type, ProtocolDecl *protocol,
+                        GenericSignature genericSig,
+                        ArrayRef<Requirement> conditionalRequirements,
+                        BuiltinConformanceKind kind);
+
   /// A callback used to produce a diagnostic for an ill-formed protocol
   /// conformance that was type-checked before we're actually walking the
   /// conformance itself, along with a bit indicating whether this diagnostic
@@ -1158,9 +1224,11 @@ public:
   GenericSignatureBuilder *getOrCreateGenericSignatureBuilder(
                                                      CanGenericSignature sig);
 
-  /// Retrieve or create a term rewriting system for answering queries on
-  /// type parameters written against the given generic signature.
-  RequirementMachine *getOrCreateRequirementMachine(
+  rewriting::RewriteContext &getRewriteContext();
+
+  /// This is a hack to break cycles. Don't introduce new callers of this
+  /// method.
+  bool isRecursivelyConstructingRequirementMachine(
       CanGenericSignature sig);
 
   /// Retrieve a generic signature with a single unconstrained type parameter,

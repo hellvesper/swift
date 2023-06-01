@@ -15,59 +15,50 @@ import Swift
 
 // ==== Task Cancellation ------------------------------------------------------
 
-/// Execute an operation with cancellation handler which will immediately be
-/// invoked if the current task is cancelled.
+/// Execute an operation with a cancellation handler that's immediately
+/// invoked if the current task is canceled.
 ///
 /// This differs from the operation cooperatively checking for cancellation
 /// and reacting to it in that the cancellation handler is _always_ and
-/// _immediately_ invoked when the task is cancelled. For example, even if the
-/// operation is running code which never checks for cancellation, a cancellation
-/// handler still would run and give us a chance to run some cleanup code.
+/// _immediately_ invoked when the task is canceled. For example, even if the
+/// operation is running code that never checks for cancellation, a cancellation
+/// handler still runs and provides a chance to run some cleanup code.
 ///
-/// Does not check for cancellation, and always executes the passed `operation`.
+/// Doesn't check for cancellation, and always executes the passed `operation`.
 ///
-/// This function returns instantly and will never suspend.
-@available(SwiftStdlib 5.5, *)
+/// This function returns immediately and never suspends.
+@available(SwiftStdlib 5.1, *)
 public func withTaskCancellationHandler<T>(
   operation: () async throws -> T,
   onCancel handler: @Sendable () -> Void
 ) async rethrows -> T {
-  let task = Builtin.getCurrentAsyncTask()
-
-  guard !_taskIsCancelled(task) else {
-    // If the current task is already cancelled, run the handler immediately.
-    handler()
-    return try await operation()
-  }
-
+  // unconditionally add the cancellation record to the task.
+  // if the task was already cancelled, it will be executed right away.
   let record = _taskAddCancellationHandler(handler: handler)
   defer { _taskRemoveCancellationHandler(record: record) }
 
   return try await operation()
 }
 
-@available(SwiftStdlib 5.5, *)
+@available(SwiftStdlib 5.1, *)
 extension Task {
-  /// Returns `true` if the task is cancelled, and should stop executing.
+  /// A Boolean value that indicates whether the task should stop executing.
+  ///
+  /// After the value of this property becomes `true`, it remains `true` indefinitely.
+  /// There is no way to uncancel a task.
   ///
   /// - SeeAlso: `checkCancellation()`
-  public var isCancelled: Bool {
-    withUnsafeCurrentTask { task in
-      guard let task = task else {
-        return false
-      }
-
-      return _taskIsCancelled(task._task)
-    }
+  @_transparent public var isCancelled: Bool {
+    _taskIsCancelled(_task)
   }
 }
 
-@available(SwiftStdlib 5.5, *)
+@available(SwiftStdlib 5.1, *)
 extension Task where Success == Never, Failure == Never {
-  /// Returns `true` if the task is cancelled, and should stop executing.
+  /// A Boolean value that indicates whether the task should stop executing.
   ///
-  /// If no current `Task` is available, returns `false`, as outside of a task
-  /// context no task cancellation may be observed.
+  /// After the value of this property becomes `true`, it remains `true` indefinitely.
+  /// There is no way to uncancel a task.
   ///
   /// - SeeAlso: `checkCancellation()`
   public static var isCancelled: Bool {
@@ -77,20 +68,11 @@ extension Task where Success == Never, Failure == Never {
   }
 }
 
-@available(SwiftStdlib 5.5, *)
+@available(SwiftStdlib 5.1, *)
 extension Task where Success == Never, Failure == Never {
-  /// Check if the task is cancelled and throw an `CancellationError` if it was.
+  /// Throws an error if the task was canceled.
   ///
-  /// It is intentional that no information is passed to the task about why it
-  /// was cancelled. A task may be cancelled for many reasons, and additional
-  /// reasons may accrue / after the initial cancellation (for example, if the
-  /// task fails to immediately exit, it may pass a deadline).
-  ///
-  /// The goal of cancellation is to allow tasks to be cancelled in a
-  /// lightweight way, not to be a secondary method of inter-task communication.
-  ///
-  /// ### Suspension
-  /// This function returns instantly and will never suspend.
+  /// The error is always an instance of `CancellationError`.
   ///
   /// - SeeAlso: `isCancelled()`
   public static func checkCancellation() throws {
@@ -100,21 +82,21 @@ extension Task where Success == Never, Failure == Never {
   }
 }
 
-/// The default cancellation thrown when a task is cancelled.
+/// An error that indicates a task was canceled.
 ///
 /// This error is also thrown automatically by `Task.checkCancellation()`,
-/// if the current task has been cancelled.
-@available(SwiftStdlib 5.5, *)
+/// if the current task has been canceled.
+@available(SwiftStdlib 5.1, *)
 public struct CancellationError: Error {
   // no extra information, cancellation is intended to be light-weight
   public init() {}
 }
 
-@available(SwiftStdlib 5.5, *)
+@available(SwiftStdlib 5.1, *)
 @_silgen_name("swift_task_addCancellationHandler")
 func _taskAddCancellationHandler(handler: () -> Void) -> UnsafeRawPointer /*CancellationNotificationStatusRecord*/
 
-@available(SwiftStdlib 5.5, *)
+@available(SwiftStdlib 5.1, *)
 @_silgen_name("swift_task_removeCancellationHandler")
 func _taskRemoveCancellationHandler(
   record: UnsafeRawPointer /*CancellationNotificationStatusRecord*/

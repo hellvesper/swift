@@ -45,6 +45,7 @@ set(swift_runtime_sources
     ExistentialContainer.cpp
     Float16Support.cpp
     FoundationSupport.cpp
+    FunctionReplacement.cpp
     Heap.cpp
     HeapObject.cpp
     ImageInspectionCommon.cpp
@@ -52,6 +53,7 @@ set(swift_runtime_sources
     ImageInspectionELF.cpp
     ImageInspectionCOFF.cpp
     ImageInspectionStatic.cpp
+    ImageInspectionWasm.cpp
     KeyPaths.cpp
     KnownMetadata.cpp
     Metadata.cpp
@@ -65,7 +67,8 @@ set(swift_runtime_sources
     RefCount.cpp
     ReflectionMirror.cpp
     RuntimeInvocationsTracking.cpp
-    SwiftDtoa.cpp)
+    SwiftDtoa.cpp
+    SwiftTLSContext.cpp)
 
 # Acknowledge that the following sources are known.
 set(LLVM_OPTIONAL_SOURCES
@@ -204,29 +207,9 @@ foreach(sdk ${SWIFT_SDKS})
     # 'GenericUnix' (eg linux)
     if(${SWIFT_SDK_${sdk}_OBJECT_FORMAT} STREQUAL ELF)
       string(TOLOWER "${sdk}" lowercase_sdk)
-      if(SWIFT_${SWIFT_HOST_VARIANT_SDK}_${SWIFT_HOST_VARIANT_ARCH}_ICU_STATICLIB)
-        set(libicu_i18n_a -licui18nswift)
-        set(libicu_uc_a -licuucswift)
-        set(libicu_data_a -licudataswift)
-      else()
-        find_package(ICU REQUIRED COMPONENTS uc i18n)
-        get_filename_component(ICU_UC_LIBDIR "${ICU_UC_LIBRARIES}" DIRECTORY)
-        get_filename_component(ICU_I18N_LIBDIR "${ICU_I18N_LIBRARIES}" DIRECTORY)
-
-        set(libicu_i18n_a -licui18n)
-        set(libicu_uc_a -licuuc)
-        set(libicu_data_a)
-        if(EXISTS ${ICU_I18N_LIBDIR}/libicui18n.a AND
-            EXISTS ${ICU_UC_LIBDIR}/libicuuc.a AND
-            EXISTS ${ICU_UC_LIBDIR}/libicudata.a)
-          set(libicu_i18n_a ${ICU_I18N_LIBDIR}/libicui18n.a)
-          set(libicu_uc_a ${ICU_UC_LIBDIR}/libicuuc.a)
-          set(libicu_data_a ${ICU_UC_LIBDIR}/libicudata.a)
-        endif()
-      endif()
       set(libpthread -lpthread)
       set(android_libraries)
-      if(sdk STREQUAL ANDROID)
+      if(${sdk} STREQUAL ANDROID)
         set(android_libraries -llog)
         set(libpthread)
       endif()
@@ -237,9 +220,6 @@ foreach(sdk ${SWIFT_SDKS})
 ${libpthread}
 ${android_libraries}
 -lswiftCore
-${libicu_i18n_a}
-${libicu_uc_a}
-${libicu_data_a}
 -lstdc++
 -lm
 -Xlinker -export-dynamic

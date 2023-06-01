@@ -34,7 +34,6 @@ namespace llvm {
 }
 
 namespace swift {
-  class GenericSignatureBuilder;
   class ArchetypeType;
   class CanType;
   class ClassDecl;
@@ -164,6 +163,7 @@ private:
   const TypeInfo *convertModuleType(ModuleType *T);
   const TypeInfo *convertProtocolType(ProtocolType *T);
   const TypeInfo *convertProtocolCompositionType(ProtocolCompositionType *T);
+  const TypeInfo *convertExistentialType(ExistentialType *T);
   const LoadableTypeInfo *convertBuiltinNativeObject();
   const LoadableTypeInfo *convertBuiltinUnknownObject();
   const LoadableTypeInfo *convertBuiltinBridgeObject();
@@ -277,8 +277,6 @@ public:
   {}
   
   ~GenericContextScope() {
-    if (!newSig)
-      return;
     assert(TC.CurGenericSignature == newSig);
     TC.setGenericContext(oldSig);
   }

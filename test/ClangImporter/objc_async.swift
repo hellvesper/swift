@@ -1,9 +1,12 @@
-// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk) -typecheck -I %S/Inputs/custom-modules -enable-experimental-concurrency %s -verify
+// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk) -typecheck -I %S/Inputs/custom-modules %s -verify -verify-additional-file %swift_src_root/test/Inputs/clang-importer-sdk/usr/include/ObjCConcurrency.h -warn-concurrency
 
 // REQUIRES: objc_interop
 // REQUIRES: concurrency
 import Foundation
 import ObjCConcurrency
+// expected-remark@-1{{add '@preconcurrency' to suppress 'Sendable'-related warnings from module 'ObjCConcurrency'}}
+
+if #available(SwiftStdlib 5.5, *) {
 
 @MainActor func onlyOnMainActor() { }
 
@@ -43,6 +46,9 @@ func testSlowServer(slowServer: SlowServer) async throws {
   let _: Int = await slowServer.bestName("hello")
   let _: Int = await slowServer.customize("hello")
 
+  slowServer.unavailableMethod() // expected-warning{{instance method 'unavailableMethod' is unavailable from asynchronous contexts}}
+  slowServer.unavailableMethodWithMessage() // expected-warning{{instance method 'unavailableMethodWithMessage' is unavailable from asynchronous contexts; Blarpy!}}
+
   let _: String = await slowServer.dance("slide")
   let _: String = await slowServer.__leap(17)
 
@@ -76,7 +82,7 @@ func testSlowServerSynchronous(slowServer: SlowServer) {
 
   slowServer.overridableButRunsOnMainThread { s in
     print(s)
-    onlyOnMainActor() // okay because parameter has @_unsafeMainActor
+    onlyOnMainActor() // okay because parameter is @MainActor
   }
 
   let _: Int = slowServer.overridableButRunsOnMainThread // expected-error{{cannot convert value of type '(((String) -> Void)?) -> Void' to specified type 'Int'}}
@@ -90,16 +96,14 @@ func testSlowServerOldSchool(slowServer: SlowServer) {
   _ = slowServer.allOperations
 }
 
-func testSendable(fn: () -> Void) { // expected-note{{parameter 'fn' is implicitly non-concurrent}}
-  doSomethingConcurrently(fn)
-  // expected-error@-1{{passing non-concurrent parameter 'fn' to function expecting a @Sendable closure}}
+func testSendable(fn: () -> Void) {
+  doSomethingConcurrently(fn) // okay, due to implicit @preconcurrency
   doSomethingConcurrentlyButUnsafe(fn) // okay, @Sendable not part of the type
 
   var x = 17
   doSomethingConcurrently {
-    print(x) // expected-error{{reference to captured var 'x' in concurrently-executing code}}
-    x = x + 1 // expected-error{{mutation of captured var 'x' in concurrently-executing code}}
-    // expected-error@-1{{reference to captured var 'x' in concurrently-executing code}}
+    print(x)
+    x = x + 1
   }
 }
 
@@ -109,6 +113,40 @@ func testSendableInAsync() async {
     x = 42 // expected-error{{mutation of captured var 'x' in concurrently-executing code}}
   }
   print(x)
+}
+
+func testSendableAttrs(
+  sendableClass: SendableClass, nonSendableClass: NonSendableClass,
+  sendableEnum: SendableEnum, nonSendableEnum: NonSendableEnum,
+  sendableOptions: SendableOptions, nonSendableOptions: NonSendableOptions,
+  sendableError: SendableError, nonSendableError: NonSendableError,
+  sendableStringEnum: SendableStringEnum, nonSendableStringEnum: NonSendableStringEnum,
+  sendableStringStruct: SendableStringStruct, nonSendableStringStruct: NonSendableStringStruct
+) async {
+  func takesSendable<T: Sendable>(_: T) {}
+
+  takesSendable(sendableClass)        // no-error
+  takesSendable(nonSendableClass)     // expected-warning{{conformance of 'NonSendableClass' to 'Sendable' is unavailable}}
+
+  doSomethingConcurrently {
+    print(sendableClass)               // no-error
+    print(nonSendableClass)            // expected-warning{{capture of 'nonSendableClass' with non-sendable type 'NonSendableClass' in a `@Sendable` closure}}
+
+    print(sendableEnum)                // no-error
+    print(nonSendableEnum)             // expected-warning{{capture of 'nonSendableEnum' with non-sendable type 'NonSendableEnum' in a `@Sendable` closure}}
+
+    print(sendableOptions)             // no-error
+    print(nonSendableOptions)          // expected-warning{{capture of 'nonSendableOptions' with non-sendable type 'NonSendableOptions' in a `@Sendable` closure}}
+
+    print(sendableError)               // no-error
+    print(nonSendableError)            // no-error--we don't respect `@_nonSendable` on `ns_error_domain` types because all errors are Sendable
+
+    print(sendableStringEnum)          // no-error
+    print(nonSendableStringEnum)       // expected-warning{{capture of 'nonSendableStringEnum' with non-sendable type 'NonSendableStringEnum' in a `@Sendable` closure}}
+
+    print(sendableStringStruct)        // no-error
+    print(nonSendableStringStruct)     // expected-warning{{capture of 'nonSendableStringStruct' with non-sendable type 'NonSendableStringStruct' in a `@Sendable` closure}}
+  }
 }
 
 // Check import of attributes
@@ -170,3 +208,26 @@ func testMirrored(instance: ClassWithAsync) async {
   await instance.protocolMethod()
   await instance.customAsyncName()
 }
+
+@MainActor class MyToolbarButton : NXButton {
+  var count = 5
+
+  func f() {
+    Task {
+      let c = count
+      print(c)
+    }
+  }
+}
+
+@MainActor class MyView: NXView {
+  func f() {
+    Task {
+      await self.g()
+    }
+  }
+
+  func g() async { }
+}
+
+} // SwiftStdlib 5.5

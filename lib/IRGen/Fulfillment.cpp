@@ -68,6 +68,7 @@ static bool isLeafTypeMetadata(CanType type) {
   case TypeKind::OpenedArchetype:
   case TypeKind::NestedArchetype:
   case TypeKind::OpaqueTypeArchetype:
+  case TypeKind::SequenceArchetype:
   case TypeKind::GenericTypeParam:
   case TypeKind::DependentMember:
     return true;
@@ -96,6 +97,10 @@ static bool isLeafTypeMetadata(CanType type) {
 
   // Protocol compositions have component types.
   case TypeKind::ProtocolComposition:
+    return false;
+
+  // Existential types have constraint types.
+  case TypeKind::Existential:
     return false;
 
   // Metatypes have instance types.

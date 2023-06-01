@@ -18,16 +18,18 @@
 #include "Scope.h"
 #include "SwitchEnumBuilder.h"
 #include "swift/AST/ASTMangler.h"
+#include "swift/AST/DiagnosticsSIL.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/NameLookup.h"
-#include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/PropertyWrappers.h"
+#include "swift/AST/ProtocolConformance.h"
 #include "swift/Basic/ProfileCounter.h"
 #include "swift/SIL/FormalLinkage.h"
 #include "swift/SIL/PrettyStackTrace.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILDebuggerClient.h"
+#include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILType.h"
 #include "swift/SIL/TypeLowering.h"
 #include "llvm/ADT/SmallString.h"
@@ -36,53 +38,52 @@
 using namespace swift;
 using namespace Lowering;
 
+// Utility for emitting diagnostics.
+template <typename... T, typename... U>
+static void diagnose(ASTContext &Context, SourceLoc loc, Diag<T...> diag,
+                     U &&...args) {
+  Context.Diags.diagnose(loc, diag, std::forward<U>(args)...);
+}
+
 void Initialization::_anchor() {}
 void SILDebuggerClient::anchor() {}
-
-static void copyOrInitValueIntoHelper(
-    SILGenFunction &SGF, SILLocation loc, ManagedValue value, bool isInit,
-    ArrayRef<InitializationPtr> subInitializations,
-    llvm::function_ref<ManagedValue(ManagedValue, unsigned, SILType)> func) {
-  auto sourceType = value.getType().castTo<TupleType>();
-  auto sourceSILType = value.getType();
-  for (unsigned i = 0, e = sourceType->getNumElements(); i != e; ++i) {
-    SILType fieldTy = sourceSILType.getTupleElementType(i);
-    ManagedValue elt = func(value, i, fieldTy);
-    subInitializations[i]->copyOrInitValueInto(SGF, loc, elt, isInit);
-    subInitializations[i]->finishInitialization(SGF);
-  }
-}
 
 void TupleInitialization::copyOrInitValueInto(SILGenFunction &SGF,
                                               SILLocation loc,
                                               ManagedValue value, bool isInit) {
+  // Process all values before initialization all at once to ensure all cleanups
+  // are setup on all tuple elements before a potential early exit.
+  SmallVector<ManagedValue, 8> destructuredValues;
+
   // In the object case, emit a destructure operation and return.
   if (value.getType().isObject()) {
-    return SGF.B.emitDestructureValueOperation(
-        loc, value, [&](unsigned i, ManagedValue subValue) {
-          auto &subInit = SubInitializations[i];
-          subInit->copyOrInitValueInto(SGF, loc, subValue, isInit);
-          subInit->finishInitialization(SGF);
-        });
+    SGF.B.emitDestructureValueOperation(loc, value, destructuredValues);
+  } else {
+    // In the address case, we forward the underlying value and store it
+    // into memory and then create a +1 cleanup. since we assume here
+    // that we have a +1 value since we are forwarding into memory.
+    assert(value.isPlusOne(SGF) && "Can not store a +0 value into memory?!");
+    CleanupCloner cloner(SGF, value);
+    SILValue v = value.forward(SGF);
+
+    auto sourceType = value.getType().castTo<TupleType>();
+    auto sourceSILType = value.getType();
+    for (unsigned i : range(sourceType->getNumElements())) {
+      SILType fieldTy = sourceSILType.getTupleElementType(i);
+      SILValue elt = SGF.B.createTupleElementAddr(loc, v, i, fieldTy);
+      if (!fieldTy.isAddressOnly(SGF.F)) {
+        elt = SGF.B.emitLoadValueOperation(loc, elt,
+                                           LoadOwnershipQualifier::Take);
+      }
+      destructuredValues.push_back(cloner.clone(elt));
+    }
   }
 
-  // In the address case, we forward the underlying value and store it
-  // into memory and then create a +1 cleanup. since we assume here
-  // that we have a +1 value since we are forwarding into memory.
-  assert(value.isPlusOne(SGF) && "Can not store a +0 value into memory?!");
-  value = ManagedValue::forUnmanaged(value.forward(SGF));
-  return copyOrInitValueIntoHelper(
-      SGF, loc, value, isInit, SubInitializations,
-      [&](ManagedValue aggregate, unsigned i,
-          SILType fieldType) -> ManagedValue {
-        ManagedValue elt =
-            SGF.B.createTupleElementAddr(loc, value, i, fieldType);
-        if (!fieldType.isAddressOnly(SGF.F)) {
-          return SGF.B.createLoadTake(loc, elt);
-        }
-
-        return SGF.emitManagedRValueWithCleanup(elt.getValue());
-      });
+  for (unsigned i : indices(destructuredValues)) {
+    SubInitializations[i]->copyOrInitValueInto(SGF, loc, destructuredValues[i],
+                                               isInit);
+    SubInitializations[i]->finishInitialization(SGF);
+  }
 }
 
 void TupleInitialization::finishUninitialized(SILGenFunction &SGF) {
@@ -460,9 +461,22 @@ public:
       needsTemporaryBuffer =
           lowering.isAddressOnly() && SGF.silConv.useLoweredAddresses();
     }
-   
+
+    // Make sure that we have a non-address only type when binding a
+    // @_noImplicitCopy let.
+    if (SGF.getASTContext().LangOpts.EnableExperimentalMoveOnly &&
+        lowering.isAddressOnly() &&
+        vd->getAttrs().hasAttribute<NoImplicitCopyAttr>()) {
+      auto d = diag::noimplicitcopy_used_on_generic_or_existential;
+      diagnose(SGF.getASTContext(), vd->getLoc(), d);
+    }
+
     if (needsTemporaryBuffer) {
-      address = SGF.emitTemporaryAllocation(vd, lowering.getLoweredType());
+      bool isLexical =
+          SGF.getASTContext().SILOpts.supportsLexicalLifetimes(SGF.getModule());
+      address =
+          SGF.emitTemporaryAllocation(vd, lowering.getLoweredType(),
+                                      false /*hasDynamicLifetime*/, isLexical);
       if (isUninitialized)
         address = SGF.B.createMarkUninitializedVar(vd, address);
       DestroyCleanup = SGF.enterDormantTemporaryCleanup(address, lowering);
@@ -521,44 +535,74 @@ public:
                                             SplitCleanups);
   }
 
-  void bindValue(SILValue value, SILGenFunction &SGF) {
+  void bindValue(SILValue value, SILGenFunction &SGF, bool wasPlusOne) {
     assert(!SGF.VarLocs.count(vd) && "Already emitted this vardecl?");
     // If we're binding an address to this let value, then we can use it as an
     // address later.  This happens when binding an address only parameter to
     // an argument, for example.
     if (value->getType().isAddress())
       address = value;
+    SILLocation PrologueLoc(vd);
+
+    if (SGF.getASTContext().SILOpts.supportsLexicalLifetimes(SGF.getModule()) &&
+        value->getOwnershipKind() != OwnershipKind::None) {
+      if (!SGF.getASTContext().LangOpts.EnableExperimentalMoveOnly) {
+        value = SILValue(
+            SGF.B.createBeginBorrow(PrologueLoc, value, /*isLexical*/ true));
+      } else {
+        // If we have an owned value that had a cleanup, then create a
+        // move_value that acts as a consuming use of the value. The reason why
+        // we want this is even if we are only performing a borrow for our
+        // lexical lifetime, we want to ensure that our defs see this
+        // initialization as consuming this value.
+        if (value->getOwnershipKind() == OwnershipKind::Owned) {
+          assert(wasPlusOne);
+          value = SILValue(SGF.B.createMoveValue(PrologueLoc, value));
+        }
+
+        if (vd->getAttrs().hasAttribute<NoImplicitCopyAttr>()) {
+          value = SILValue(SGF.B.createBeginBorrow(PrologueLoc, value,
+                                                   /*isLexical*/ true));
+          value = SGF.B.createCopyValue(PrologueLoc, value);
+          value = SGF.B.createMoveValue(PrologueLoc, value);
+        } else {
+          value = SILValue(
+              SGF.B.createBeginBorrow(PrologueLoc, value, /*isLexical*/ true));
+        }
+      }
+    }
+
     SGF.VarLocs[vd] = SILGenFunction::VarLoc::get(value);
 
     // Emit a debug_value[_addr] instruction to record the start of this value's
     // lifetime, if permitted to do so.
     if (!EmitDebugValueOnInit)
       return;
-    SILLocation PrologueLoc(vd);
     PrologueLoc.markAsPrologue();
     SILDebugVariable DbgVar(vd->isLet(), /*ArgNo=*/0);
     SGF.B.emitDebugDescription(PrologueLoc, value, DbgVar);
   }
-  
+
   void copyOrInitValueInto(SILGenFunction &SGF, SILLocation loc,
                            ManagedValue value, bool isInit) override {
     // If this let value has an address, we can handle it just like a single
     // buffer value.
-    if (hasAddress())
+    if (hasAddress()) {
       return SingleBufferInitialization::
         copyOrInitValueIntoSingleBuffer(SGF, loc, value, isInit, address);
-    
+    }
+
     // Otherwise, we bind the value.
     if (isInit) {
       // Disable the rvalue expression cleanup, since the let value
       // initialization has a cleanup that lives for the entire scope of the
       // let declaration.
-      bindValue(value.forward(SGF), SGF);
+      bindValue(value.forward(SGF), SGF, value.isPlusOne(SGF));
     } else {
       // Disable the expression cleanup of the copy, since the let value
       // initialization has a cleanup that lives for the entire scope of the
       // let declaration.
-      bindValue(value.copyUnmanaged(SGF, loc).forward(SGF), SGF);
+      bindValue(value.copyUnmanaged(SGF, loc).forward(SGF), SGF, true);
     }
   }
 
@@ -1145,8 +1189,6 @@ SILGenFunction::emitInitializationForVarDecl(VarDecl *vd, bool forceImmutable) {
 void SILGenFunction::emitPatternBinding(PatternBindingDecl *PBD,
                                         unsigned idx) {
   auto &C = PBD->getASTContext();
-  auto initialization = emitPatternBindingInitialization(PBD->getPattern(idx),
-                                                         JumpDest::invalid());
 
   // If this is an async let, create a child task to compute the initializer
   // value.
@@ -1163,11 +1205,18 @@ void SILGenFunction::emitPatternBinding(PatternBindingDecl *PBD,
            "Could not find async let autoclosure");
     bool isThrowing = init->getType()->castTo<AnyFunctionType>()->isThrowing();
 
+    // Allocate space to receive the child task's result.
+    auto initLoweredTy = getLoweredType(AbstractionPattern::getOpaque(),
+                                        PBD->getPattern(idx)->getType());
+    SILLocation loc(PBD);
+    SILValue resultBuf = emitTemporaryAllocation(loc, initLoweredTy);
+    SILValue resultBufPtr = B.createAddressToPointer(loc, resultBuf,
+                          SILType::getPrimitiveObjectType(C.TheRawPointerType));
+    
     // Emit the closure for the child task.
     // Prepare the opaque `AsyncLet` representation.
     SILValue alet;
     {
-      SILLocation loc(PBD);
 
       // Currently we don't pass any task options here, so just grab a 'nil'.
 
@@ -1181,20 +1230,23 @@ void SILGenFunction::emitPatternBinding(PatternBindingDecl *PBD,
           loc,
           options.forward(*this), // options is B.createManagedOptionalNone
           init->getType(),
-          emitRValue(init).getScalarValue()
+          emitRValue(init).getScalarValue(),
+          resultBufPtr
         ).forward(*this);
     }
-
+    
     // Push a cleanup to destroy the AsyncLet along with the task and child record.
-    enterAsyncLetCleanup(alet);
+    enterAsyncLetCleanup(alet, resultBufPtr);
 
     // Save the child task so we can await it as needed.
-    AsyncLetChildTasks[{PBD, idx}] = { alet, isThrowing };
+    AsyncLetChildTasks[{PBD, idx}] = {alet, resultBufPtr, isThrowing};
+    return;
+  }
 
-    // Mark as uninitialized; actual initialization will occur when the
-    // variables are referenced.
-    initialization->finishUninitialized(*this);
-  } else if (auto *Init = PBD->getExecutableInit(idx)) {
+  auto initialization = emitPatternBindingInitialization(PBD->getPattern(idx),
+                                                         JumpDest::invalid());
+
+  if (auto *Init = PBD->getExecutableInit(idx)) {
     // If an initial value expression was specified by the decl, emit it into
     // the initialization.
     FullExpr Scope(Cleanups, CleanupLocation(Init));
@@ -1323,8 +1375,13 @@ void SILGenFunction::emitStmtCondition(StmtCondition Cond, JumpDest FalseDest,
 
     switch (elt.getKind()) {
     case StmtConditionElement::CK_PatternBinding: {
-      InitializationPtr initialization =
-        emitPatternBindingInitialization(elt.getPattern(), FalseDest);
+          // Begin a new binding scope, which is popped when the next innermost debug
+          // scope ends. The cleanup location loc isn't the perfect source location
+          // but it's close enough.
+          B.getSILGenFunction().enterDebugScope(loc,
+                                                      /*isBindingScope=*/true);
+        InitializationPtr initialization =
+          emitPatternBindingInitialization(elt.getPattern(), FalseDest);
 
       // Emit the initial value into the initialization.
       FullExpr Scope(Cleanups, CleanupLocation(elt.getInitializer()));
@@ -1530,26 +1587,30 @@ namespace {
 /// A cleanup that destroys the AsyncLet along with the child task and record.
 class AsyncLetCleanup: public Cleanup {
   SILValue alet;
+  SILValue resultBuf;
 public:
-  AsyncLetCleanup(SILValue alet) : alet(alet) { }
+  AsyncLetCleanup(SILValue alet, SILValue resultBuf)
+    : alet(alet), resultBuf(resultBuf) { }
 
   void emit(SILGenFunction &SGF, CleanupLocation l,
             ForUnwind_t forUnwind) override {
-    SGF.emitEndAsyncLet(l, alet);
+    SGF.emitFinishAsyncLet(l, alet, resultBuf);
   }
 
   void dump(SILGenFunction &) const override {
 #ifndef NDEBUG
     llvm::errs() << "AsyncLetCleanup\n"
-                 << "AsyncLet:" << alet << "\n";
+                 << "AsyncLet:" << alet << "\n"
+                 << "result buffer:" << resultBuf << "\n";
 #endif
   }
 };
 } // end anonymous namespace
 
-CleanupHandle SILGenFunction::enterAsyncLetCleanup(SILValue alet) {
+CleanupHandle SILGenFunction::enterAsyncLetCleanup(SILValue alet,
+                                                   SILValue resultBuf) {
   Cleanups.pushCleanupInState<AsyncLetCleanup>(
-      CleanupState::Active, alet);
+      CleanupState::Active, alet, resultBuf);
   return Cleanups.getTopCleanup();
 }
 
@@ -1702,8 +1763,41 @@ void SILGenFunction::destroyLocalVariable(SILLocation silLoc, VarDecl *vd) {
   // For 'let' bindings, we emit a release_value or destroy_addr, depending on
   // whether we have an address or not.
   SILValue Val = loc.value;
-  if (!Val->getType().isAddress())
-    B.emitDestroyValueOperation(silLoc, Val);
-  else
+
+  if (Val->getType().isAddress()) {
     B.createDestroyAddr(silLoc, Val);
+    return;
+  }
+
+  if (!getASTContext().SILOpts.supportsLexicalLifetimes(getModule())) {
+    B.emitDestroyValueOperation(silLoc, Val);
+    return;
+  }
+
+  if (Val->getOwnershipKind() == OwnershipKind::None) {
+    return;
+  }
+
+  if (auto *bbi = dyn_cast<BeginBorrowInst>(Val.getDefiningInstruction())) {
+    B.createEndBorrow(silLoc, bbi);
+    B.emitDestroyValueOperation(silLoc, bbi->getOperand());
+    return;
+  }
+
+  if (getASTContext().LangOpts.EnableExperimentalMoveOnly) {
+    if (auto *mvi = dyn_cast<MoveValueInst>(Val.getDefiningInstruction())) {
+      if (auto *cvi = dyn_cast<CopyValueInst>(mvi->getOperand())) {
+        if (auto *bbi = dyn_cast<BeginBorrowInst>(cvi->getOperand())) {
+          if (bbi->isLexical()) {
+            B.emitDestroyValueOperation(silLoc, mvi);
+            B.createEndBorrow(silLoc, bbi);
+            B.emitDestroyValueOperation(silLoc, bbi->getOperand());
+            return;
+          }
+        }
+      }
+    }
+  }
+
+  llvm_unreachable("unhandled case");
 }

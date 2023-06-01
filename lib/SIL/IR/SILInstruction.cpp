@@ -426,11 +426,6 @@ namespace {
       return true;
     }
 
-    bool visitProjectValueBufferInst(const ProjectValueBufferInst *RHS) {
-      auto *X = cast<ProjectValueBufferInst>(LHS);
-      return X->getValueType() == RHS->getValueType();
-    }
-
     bool visitProjectBoxInst(const ProjectBoxInst *RHS) {
       return true;
     }
@@ -1107,10 +1102,7 @@ bool SILInstruction::mayHaveSideEffects() const {
   if (mayTrap())
     return true;
 
-  MemoryBehavior B = getMemoryBehavior();
-  return B == MemoryBehavior::MayWrite ||
-    B == MemoryBehavior::MayReadWrite ||
-    B == MemoryBehavior::MayHaveSideEffects;
+  return mayWriteToMemory();
 }
 
 bool SILInstruction::mayRelease() const {
@@ -1129,6 +1121,7 @@ bool SILInstruction::mayRelease() const {
   default:
     llvm_unreachable("Unhandled releasing instruction!");
 
+  case SILInstructionKind::EndLifetimeInst:
   case SILInstructionKind::GetAsyncContinuationInst:
   case SILInstructionKind::GetAsyncContinuationAddrInst:
   case SILInstructionKind::AwaitAsyncContinuationInst:
@@ -1171,6 +1164,10 @@ bool SILInstruction::mayRelease() const {
     return CopyAddr->isInitializationOfDest() ==
            IsInitialization_t::IsNotInitialization;
   }
+  // mark_unresolved_move_addr is equivalent to a copy_addr [init], so a release
+  // does not occur.
+  case SILInstructionKind::MarkUnresolvedMoveAddrInst:
+    return false;
 
   case SILInstructionKind::BuiltinInst: {
     auto *BI = cast<BuiltinInst>(this);
@@ -1268,6 +1265,12 @@ bool SILInstruction::isAllocatingStack() const {
   if (auto *PA = dyn_cast<PartialApplyInst>(this))
     return PA->isOnStack();
 
+  if (auto *BI = dyn_cast<BuiltinInst>(this)) {
+    if (BI->getBuiltinKind() == BuiltinValueKind::StackAlloc) {
+      return true;
+    }
+  }
+
   return false;
 }
 
@@ -1279,6 +1282,13 @@ bool SILInstruction::isDeallocatingStack() const {
     if (DRI->canAllocOnStack())
       return true;
   }
+
+  if (auto *BI = dyn_cast<BuiltinInst>(this)) {
+    if (BI->getBuiltinKind() == BuiltinValueKind::StackDealloc) {
+      return true;
+    }
+  }
+
   return false;
 }
 
@@ -1360,13 +1370,18 @@ bool SILInstruction::mayTrap() const {
   }
 }
 
+bool SILInstruction::maySynchronize() const {
+  // TODO: We need side-effect analysis and library annotation for this to be
+  //       a reasonable API.  For now, this is just a placeholder.
+  return isa<FullApplySite>(this);
+}
+
 bool SILInstruction::isMetaInstruction() const {
   // Every instruction that implements getVarInfo() should be in this list.
   switch (getKind()) {
   case SILInstructionKind::AllocBoxInst:
   case SILInstructionKind::AllocStackInst:
   case SILInstructionKind::DebugValueInst:
-  case SILInstructionKind::DebugValueAddrInst:
     return true;
   default:
     return false;

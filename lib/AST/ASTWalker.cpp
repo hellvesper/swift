@@ -539,12 +539,10 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
   }
 
   Expr *visitObjectLiteralExpr(ObjectLiteralExpr *E) {
-    if (Expr *arg = E->getArg()) {
-      if (Expr *arg2 = doIt(arg)) {
-        E->setArg(arg2);
-      } else {
-        return nullptr;
-      }
+    if (auto *args = doIt(E->getArgs())) {
+      E->setArgs(args);
+    } else {
+      return nullptr;
     }
     return E;
   }
@@ -609,11 +607,12 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
       E->setBase(Base);
     else
       return nullptr;
-    
-    if (Expr *Index = doIt(E->getIndex()))
-      E->setIndex(Index);
-    else
+
+    if (auto *args = doIt(E->getArgs())) {
+      E->setArgs(args);
+    } else {
       return nullptr;
+    }
     
     return E;
   }
@@ -635,11 +634,12 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
       E->setBase(Base);
     else
       return nullptr;
-    
-    if (Expr *Index = doIt(E->getIndex()))
-      E->setIndex(Index);
-    else
+
+    if (auto *args = doIt(E->getArgs())) {
+      E->setArgs(args);
+    } else {
       return nullptr;
+    }
     
     return E;
   }
@@ -853,15 +853,10 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
       E->setFn(E2);
     }
 
-    if (E->getArg()) {
-      Expr *E2 = doIt(E->getArg());
-      if (E2 == nullptr) return nullptr;
-      
-      // Protect against setting a non-tuple argument expression for a binop,
-      // which may occur as a result of error recovery.
-      // E.g., "print(Array<Int)"
-      if (!isa<BinaryExpr>(E) || isa<TupleExpr>(E2))
-        E->setArg(E2);
+    if (auto *args = doIt(E->getArgs())) {
+      E->setArgs(args);
+    } else {
+      return nullptr;
     }
 
     return E;
@@ -1089,30 +1084,15 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
         return nullptr;
     }
 
-    SmallVector<KeyPathExpr::Component, 4> updatedComponents;
-    bool didChangeComponents = false;
     for (auto &origComponent : components) {
       auto component = origComponent;
       switch (auto kind = component.getKind()) {
       case KeyPathExpr::Component::Kind::Subscript:
       case KeyPathExpr::Component::Kind::UnresolvedSubscript: {
-        Expr *origIndex = component.getIndexExpr();
-        Expr *newIndex = doIt(origIndex);
-        if (!newIndex) return nullptr;
-        if (newIndex != origIndex) {
-          didChangeComponents = true;
-          component = kind == KeyPathExpr::Component::Kind::Subscript
-            ? KeyPathExpr::Component::forSubscriptWithPrebuiltIndexExpr(
-                component.getDeclRef(),
-                newIndex,
-                component.getSubscriptLabels(),
-                component.getComponentType(),
-                component.getLoc(),
-                component.getSubscriptIndexHashableConformances())
-            : KeyPathExpr::Component
-                         ::forUnresolvedSubscriptWithPrebuiltIndexExpr(
-                E->getType()->getASTContext(),
-                newIndex, component.getSubscriptLabels(), component.getLoc());
+        if (auto *newArgs = doIt(component.getSubscriptArgs())) {
+          component.setSubscriptArgs(newArgs);
+        } else {
+          return nullptr;
         }
         break;
       }
@@ -1130,14 +1110,7 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
         // No subexpr to visit.
         break;
       }
-      updatedComponents.push_back(component);
     }
-    
-    if (didChangeComponents) {
-      E->resolveComponents(E->getType()->getASTContext(),
-                           updatedComponents);
-    }
-
     return E;
   }
 
@@ -1176,6 +1149,15 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
       }
     }
 
+    return E;
+  }
+
+  Expr *visitRegexLiteralExpr(RegexLiteralExpr *E) {
+    if (auto *newExpr = doIt(E->getSemanticExpr())) {
+      E->setSemanticExpr(newExpr);
+    } else {
+      return nullptr;
+    }
     return E;
   }
 
@@ -1241,7 +1223,7 @@ public:
   }
   
   bool shouldSkip(Decl *D) {
-    if (isa<VarDecl>(D)) {
+    if (auto *VD = dyn_cast<VarDecl>(D)) {
       // VarDecls are walked via their NamedPattern, ignore them if we encounter
       // then in the few cases where they are also pushed outside as members.
       // In all those cases we can walk them via the pattern binding decl.
@@ -1250,10 +1232,10 @@ public:
       if (Walker.Parent.getAsModule() &&
           D->getDeclContext()->getParentSourceFile())
         return true;
-      if (Decl *ParentD = Walker.Parent.getAsDecl())
-        return (isa<NominalTypeDecl>(ParentD) || isa<ExtensionDecl>(ParentD));
+      if (Walker.Parent.getAsDecl() && VD->getParentPatternBinding())
+        return true;
       auto walkerParentAsStmt = Walker.Parent.getAsStmt();
-      if (walkerParentAsStmt && isa<BraceStmt>(walkerParentAsStmt))
+      if (isa_and_nonnull<BraceStmt>(walkerParentAsStmt))
         return true;
     }
     return false;
@@ -1366,6 +1348,20 @@ public:
     }
 
     return false;
+  }
+
+  ArgumentList *doIt(ArgumentList *ArgList) {
+    bool WalkChildren;
+    std::tie(WalkChildren, ArgList) = Walker.walkToArgumentListPre(ArgList);
+    if (!WalkChildren || !ArgList)
+      return ArgList;
+
+    for (auto Idx : indices(*ArgList)) {
+      auto *E = doIt(ArgList->getExpr(Idx));
+      if (!E) return nullptr;
+      ArgList->setExpr(Idx, E);
+    }
+    return Walker.walkToArgumentListPost(ArgList);
   }
 };
 
@@ -1855,12 +1851,20 @@ bool Traversal::visitIsolatedTypeRepr(IsolatedTypeRepr *T) {
   return doIt(T->getBase());
 }
 
+bool Traversal::visitCompileTimeConstTypeRepr(CompileTimeConstTypeRepr *T) {
+  return doIt(T->getBase());
+}
+
 bool Traversal::visitOpaqueReturnTypeRepr(OpaqueReturnTypeRepr *T) {
   return doIt(T->getConstraint());
 }
 
 bool Traversal::visitNamedOpaqueReturnTypeRepr(NamedOpaqueReturnTypeRepr *T) {
   return doIt(T->getBase());
+}
+
+bool Traversal::visitExistentialTypeRepr(ExistentialTypeRepr *T) {
+  return doIt(T->getConstraint());
 }
 
 bool Traversal::visitPlaceholderTypeRepr(PlaceholderTypeRepr *T) {
@@ -1910,5 +1914,9 @@ bool Decl::walk(ASTWalker &walker) {
 }
 
 bool GenericParamList::walk(ASTWalker &walker) {
+  return Traversal(walker).doIt(this);
+}
+
+ArgumentList *ArgumentList::walk(ASTWalker &walker) {
   return Traversal(walker).doIt(this);
 }

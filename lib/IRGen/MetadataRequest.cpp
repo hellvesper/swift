@@ -269,7 +269,8 @@ llvm::Constant *IRGenModule::getAddrOfStringForMetadataRef(
       return addr;
 
     auto bitConstant = llvm::ConstantInt::get(IntPtrTy, 1);
-    return llvm::ConstantExpr::getGetElementPtr(nullptr, addr, bitConstant);
+    return llvm::ConstantExpr::getGetElementPtr(
+      addr->getType()->getPointerElementType(), addr, bitConstant);
   };
 
   // Check whether we already have an entry with this name.
@@ -1114,7 +1115,8 @@ static llvm::Constant *emitEmptyTupleTypeMetadataRef(IRGenModule &IGM) {
     llvm::ConstantInt::get(IGM.Int32Ty, 1)
   };
   return llvm::ConstantExpr::getInBoundsGetElementPtr(
-        /*Ty=*/nullptr, fullMetadata, indices);
+        fullMetadata->getType()->getPointerElementType(), fullMetadata,
+        indices);
 }
 
 using GetElementMetadataFn =
@@ -1591,7 +1593,9 @@ namespace {
         }
 
         auto *getMetadataFn = type->getGlobalActor()
-            ? IGF.IGM.getGetFunctionMetadataGlobalActorFn()
+            ? (IGF.IGM.isConcurrencyAvailable()
+               ? IGF.IGM.getGetFunctionMetadataGlobalActorFn()
+               : IGF.IGM.getGetFunctionMetadataGlobalActorBackDeployFn())
             : type->isDifferentiable()
               ? IGF.IGM.getGetFunctionMetadataDifferentiableFn()
               : IGF.IGM.getGetFunctionMetadataFn();
@@ -1661,12 +1665,17 @@ namespace {
         };
         return MetadataResponse::forComplete(
           llvm::ConstantExpr::getInBoundsGetElementPtr(
-            /*Ty=*/nullptr, singletonMetadata, indices));
+            singletonMetadata->getType()->getPointerElementType(),
+            singletonMetadata, indices));
       }
 
       auto layout = type.getExistentialLayout();
-      
-      auto protocols = layout.getProtocols();
+
+      SmallVector<ProtocolType *, 4> protocols;
+      for (auto proto : layout.getProtocols()) {
+        if (!proto->getDecl()->isMarkerProtocol())
+          protocols.push_back(proto);
+      }
 
       // Collect references to the protocol descriptors.
       auto descriptorArrayTy
@@ -1721,6 +1730,12 @@ namespace {
     MetadataResponse
     visitProtocolCompositionType(CanProtocolCompositionType type,
                                  DynamicMetadataRequest request) {
+      return emitExistentialTypeMetadata(type, request);
+    }
+
+    MetadataResponse
+    visitExistentialType(CanExistentialType type,
+                         DynamicMetadataRequest request) {
       return emitExistentialTypeMetadata(type, request);
     }
 
@@ -2475,7 +2490,11 @@ static bool shouldAccessByMangledName(IRGenModule &IGM, CanType type) {
   // Never access by mangled name if we've been asked not to.
   if (IGM.getOptions().DisableConcreteTypeMetadataMangledNameAccessors)
     return false;
-  
+
+  // Do not access by mangled name if the runtime won't understand it.
+  if (mangledNameIsUnknownToDeployTarget(IGM, type))
+    return false;
+
   // A nongeneric nominal type with nontrivial metadata has an accessor
   // already we can just call.
   if (auto nom = dyn_cast<NominalType>(type)) {
@@ -2485,22 +2504,7 @@ static bool shouldAccessByMangledName(IRGenModule &IGM, CanType type) {
       return false;
     }
   }
-  
-  // The Swift 5.1 runtime fails to demangle associated types of opaque types.
-  if (!IGM.getAvailabilityContext().isContainedIn(IGM.Context.getSwift52Availability())) {
-    auto hasNestedOpaqueArchetype = type.findIf([](CanType sub) -> bool {
-      if (auto archetype = dyn_cast<NestedArchetypeType>(sub)) {
-        if (isa<OpaqueTypeArchetypeType>(archetype->getRoot())) {
-          return true;
-        }
-      }
-      return false;
-    });
-    
-    if (hasNestedOpaqueArchetype)
-      return false;
-  }
-  
+
   return true;
 
 // The visitor below can be used to fine-tune a heuristic to decide whether
@@ -2655,9 +2659,16 @@ emitMetadataAccessByMangledName(IRGenFunction &IGF, CanType type,
   unsigned mangledStringSize;
   std::tie(mangledString, mangledStringSize) =
     IGM.getTypeRef(type, CanGenericSignature(), MangledTypeRefRole::Metadata);
-  
-  assert(mangledStringSize < 0x80000000u
-         && "2GB of mangled name ought to be enough for anyone");
+
+  // Android AArch64 reserves the top byte of the address for memory tagging
+  // since Android 11, so only use the bottom 23 bits to store this size
+  // and the 24th bit to signal that there is a size.
+  if (IGM.Triple.isAndroid() && IGM.Triple.getArch() == llvm::Triple::aarch64)
+    assert(mangledStringSize < 0x00800001u &&
+           "8MB of mangled name ought to be enough for Android AArch64");
+  else
+    assert(mangledStringSize < 0x80000000u &&
+           "2GB of mangled name ought to be enough for anyone");
   
   // Get or create the cache variable if necessary.
   auto cache = IGM.getAddrOfTypeMetadataDemanglingCacheVariable(type,
@@ -2727,6 +2738,21 @@ emitMetadataAccessByMangledName(IRGenFunction &IGF, CanType type,
     auto contBB = subIGF.createBasicBlock("");
     llvm::Value *comparison = subIGF.Builder.CreateICmpSLT(load,
                                       llvm::ConstantInt::get(IGM.Int64Ty, 0));
+
+    // Check if the 24th bit is set on Android AArch64 and only instantiate the
+    // type metadata if it is, as otherwise it might be negative only because
+    // of the memory tag on Android.
+    if (IGM.Triple.isAndroid() &&
+        IGM.Triple.getArch() == llvm::Triple::aarch64) {
+
+      auto getBitAfterAndroidTag = subIGF.Builder.CreateAnd(
+        load, llvm::ConstantInt::get(IGM.Int64Ty, 0x0080000000000000));
+      auto checkNotAndroidTag = subIGF.Builder.CreateICmpNE(
+        getBitAfterAndroidTag, llvm::ConstantInt::get(IGM.Int64Ty, 0));
+
+      comparison = subIGF.Builder.CreateAnd(comparison, checkNotAndroidTag);
+    }
+
     comparison = subIGF.Builder.CreateExpect(comparison,
                                        llvm::ConstantInt::get(IGM.Int1Ty, 0));
     subIGF.Builder.CreateCondBr(comparison, isUnfilledBB, contBB);
@@ -3411,7 +3437,7 @@ llvm::Value *irgen::emitClassHeapMetadataRef(IRGenFunction &IGF, CanType type,
                                              bool allowUninitialized) {
   assert(request.canResponseStatusBeIgnored() &&
          "emitClassHeapMetadataRef only supports satisfied requests");
-  assert(type->mayHaveSuperclass());
+  assert(type->mayHaveSuperclass() || type->isTypeErasedGenericClassType());
 
   // Archetypes may or may not be ObjC classes and need unwrapping to get at
   // the class object.
@@ -3426,7 +3452,7 @@ llvm::Value *irgen::emitClassHeapMetadataRef(IRGenFunction &IGF, CanType type,
     return classPtr;
   }
   
-  if (ClassDecl *theClass = type->getClassOrBoundGenericClass()) {
+  if (ClassDecl *theClass = dyn_cast_or_null<ClassDecl>(type->getAnyNominal())) {
     if (!hasKnownSwiftMetadata(IGF.IGM, theClass)) {
       llvm::Value *result =
         emitObjCHeapMetadataRef(IGF, theClass, allowUninitialized);

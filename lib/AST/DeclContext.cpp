@@ -39,12 +39,6 @@ STATISTIC(NumLazyIterableDeclContexts,
 STATISTIC(NumUnloadedLazyIterableDeclContexts,
           "# of serialized iterable declaration contexts never loaded");
 
-// Only allow allocation of DeclContext using the allocator in ASTContext.
-void *DeclContext::operator new(size_t Bytes, ASTContext &C,
-                                unsigned Alignment) {
-  return C.Allocate(Bytes, Alignment);
-}
-
 ASTContext &DeclContext::getASTContext() const {
   return getParentModule()->getASTContext();
 }
@@ -86,6 +80,16 @@ ProtocolDecl *DeclContext::getExtendedProtocolDecl() const {
   if (auto decl = const_cast<Decl*>(getAsDecl()))
     if (auto ED = dyn_cast<ExtensionDecl>(decl))
       return dyn_cast_or_null<ProtocolDecl>(ED->getExtendedNominal());
+  return nullptr;
+}
+
+VarDecl *DeclContext::getNonLocalVarDecl() const {
+  if (auto *init = dyn_cast<PatternBindingInitializer>(this)) {
+   if (auto *var =
+         init->getBinding()->getAnchoringVarDecl(init->getBindingIndex())) {
+      return var;
+     }
+  }
   return nullptr;
 }
 
@@ -145,7 +149,7 @@ void DeclContext::forEachGenericContext(
         if (auto *gpList = genericCtx->getGenericParams())
           fn(gpList);
     }
-  } while ((dc = dc->getParent()));
+  } while ((dc = dc->getParentForLookup()));
 }
 
 unsigned DeclContext::getGenericContextDepth() const {
@@ -679,7 +683,7 @@ unsigned DeclContext::printContext(raw_ostream &OS, const unsigned indent,
     }
     case InitializerKind::PropertyWrapper: {
       auto init = cast<PropertyWrapperInitializer>(this);
-      OS << "PropertyWrapper 0x" << (void*)init->getParam() << ", kind=";
+      OS << "PropertyWrapper 0x" << (void*)init->getWrappedVar() << ", kind=";
       switch (init->getKind()) {
       case PropertyWrapperInitializer::Kind::WrappedValue:
         OS << "wrappedValue";
@@ -873,6 +877,10 @@ void IterableDeclContext::addMemberSilently(Decl *member, Decl *hint,
       if (d->isImplicit())
         return true;
 
+      // Imported decls won't have complete location info.
+      if (d->hasClangNode())
+        return true;
+
       return false;
     };
 
@@ -968,6 +976,10 @@ bool IterableDeclContext::hasUnparsedMembers() const {
   return true;
 }
 
+void IterableDeclContext::setHasLazyMembers(bool hasLazyMembers) const {
+  FirstDeclAndLazyMembers.setInt(hasLazyMembers);
+}
+
 void IterableDeclContext::loadAllMembers() const {
   ASTContext &ctx = getASTContext();
 
@@ -992,7 +1004,7 @@ void IterableDeclContext::loadAllMembers() const {
     return;
 
   // Don't try to load all members re-entrant-ly.
-  FirstDeclAndLazyMembers.setInt(false);
+  setHasLazyMembers(false);
 
   const Decl *container = getDecl();
   auto contextInfo = ctx.getOrCreateLazyIterableContextData(this,
@@ -1204,6 +1216,32 @@ bool DeclContext::isClassConstrainedProtocolExtension() const {
     }
   }
   return false;
+}
+
+bool DeclContext::isAsyncContext() const {
+  switch (getContextKind()) {
+  case DeclContextKind::Initializer:
+  case DeclContextKind::TopLevelCodeDecl:
+  case DeclContextKind::EnumElementDecl:
+  case DeclContextKind::ExtensionDecl:
+  case DeclContextKind::SerializedLocal:
+  case DeclContextKind::Module:
+  case DeclContextKind::FileUnit:
+  case DeclContextKind::GenericTypeDecl:
+    return false;
+  case DeclContextKind::AbstractClosureExpr:
+    return cast<AbstractClosureExpr>(this)->isBodyAsync();
+  case DeclContextKind::AbstractFunctionDecl: {
+    const AbstractFunctionDecl *function = cast<AbstractFunctionDecl>(this);
+    return function->hasAsync();
+  }
+  case DeclContextKind::SubscriptDecl: {
+    AccessorDecl *getter =
+        cast<SubscriptDecl>(this)->getAccessor(AccessorKind::Get);
+    return getter != nullptr && getter->hasAsync();
+  }
+  }
+  llvm_unreachable("Unhandled DeclContextKind switch");
 }
 
 SourceLoc swift::extractNearestSourceLoc(const DeclContext *dc) {

@@ -99,6 +99,10 @@ PrintOptions SymbolGraph::getDeclarationFragmentsPrintOptions() const {
   ExcludeAttrs.insert(std::make_pair("DAK_Postfix", DAK_Postfix));
   ExcludeAttrs.insert(std::make_pair("DAK_Infix", DAK_Infix));
 
+  // In "emit modules separately" jobs, access modifiers show up as attributes,
+  // but we don't want them to be printed in declarations
+  ExcludeAttrs.insert(std::make_pair("DAK_AccessControl", DAK_AccessControl));
+
   for (const auto &Entry : ExcludeAttrs) {
     Opts.ExcludeAttrList.push_back(Entry.getValue());
   }
@@ -431,16 +435,11 @@ SymbolGraph::recordRequirementRelationships(Symbol S) {
 void SymbolGraph::recordOptionalRequirementRelationships(Symbol S) {
   const auto VD = S.getSymbolDecl();
   if (const auto *Protocol = dyn_cast<ProtocolDecl>(VD->getDeclContext())) {
-    if (VD->isProtocolRequirement()) {
-      if (const auto *ClangDecl = VD->getClangDecl()) {
-        if (const auto *Method = dyn_cast<clang::ObjCMethodDecl>(ClangDecl)) {
-          if (Method->isOptional()) {
-            recordEdge(Symbol(this, VD, nullptr),
-                       Symbol(this, Protocol, nullptr),
-                       RelationshipKind::OptionalRequirementOf());
-          }
-        }
-      }
+    if (VD->isProtocolRequirement() &&
+        VD->getAttrs().hasAttribute<OptionalAttr>()) {
+      recordEdge(Symbol(this, VD, nullptr),
+                 Symbol(this, Protocol, nullptr),
+                 RelationshipKind::OptionalRequirementOf());
     }
   }
 }
@@ -583,9 +582,23 @@ bool SymbolGraph::isImplicitlyPrivate(const Decl *D,
   }
 
   // Don't record effectively internal declarations if specified
-  if (Walker.Options.MinimumAccessLevel > AccessLevel::Internal &&
-      D->hasUnderscoredNaming()) {
-    return true;
+  if (D->hasUnderscoredNaming()) {
+    AccessLevel symLevel = AccessLevel::Public;
+    if (const ValueDecl *VD = dyn_cast<ValueDecl>(D)) {
+      symLevel = VD->getFormalAccess();
+    }
+
+    // Underscored symbols should be treated as `internal`, unless they're already
+    // marked that way - in that case, treat them as `private`
+    AccessLevel effectiveLevel;
+    if (symLevel > AccessLevel::Internal) {
+      effectiveLevel = AccessLevel::Internal;
+    } else {
+      effectiveLevel = AccessLevel::Private;
+    }
+
+    if (Walker.Options.MinimumAccessLevel > effectiveLevel)
+      return true;
   }
 
   // Don't include declarations with the @_spi attribute unless the
@@ -653,10 +666,6 @@ bool SymbolGraph::canIncludeDeclAsNode(const Decl *D) const {
   // If this decl isn't in this module, don't record it,
   // as it will appear elsewhere in its module's symbol graph.
   if (D->getModuleContext()->getName() != M.getName()) {
-    return false;
-  }
-
-  if (D->isImplicit()) {
     return false;
   }
 

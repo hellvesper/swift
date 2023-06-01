@@ -354,9 +354,6 @@ public:
   /// imported.
   bool shouldImportSwiftConcurrency() const;
 
-  /// Whether the Distributed support library should be implicitly imported.
-  bool shouldImportSwiftDistributed() const;
-
   /// Performs input setup common to these tools:
   /// sil-opt, sil-func-extractor, sil-llvm-gen, and sil-nm.
   /// Return value includes the buffer so caller can keep it alive.
@@ -391,8 +388,6 @@ public:
   std::string getModuleInterfaceOutputPathForWholeModule() const;
   std::string getPrivateModuleInterfaceOutputPathForWholeModule() const;
 
-  std::string getLdAddCFileOutputPathForWholeModule() const;
-
 public:
   /// Given the current configuration of this frontend invocation, a set of
   /// supplementary output paths, and a module, compute the appropriate set of
@@ -403,15 +398,6 @@ public:
   SerializationOptions
   computeSerializationOptions(const SupplementaryOutputPaths &outs,
                               const ModuleDecl *module) const;
-
-  /// Returns an approximation of whether the given module could be
-  /// redistributed and consumed by external clients.
-  ///
-  /// FIXME: The scope of this computation should be limited entirely to
-  /// PrintAsObjC. Unfortunately, it has been co-opted to support the
-  /// \c SerializeOptionsForDebugging hack. Once this information can be
-  /// transferred from module files to the dSYMs, remove this.
-  bool isModuleExternallyConsumed(const ModuleDecl *mod) const;
 };
 
 /// A class which manages the state and execution of the compiler.

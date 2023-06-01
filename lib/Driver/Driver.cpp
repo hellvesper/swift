@@ -178,8 +178,6 @@ static void validateDependencyScanningArgs(DiagnosticEngine &diags,
       args.getLastArg(options::OPT_reuse_dependency_scan_cache);
   const Arg *CacheSerializationPath =
       args.getLastArg(options::OPT_dependency_scan_cache_path);
-  const Arg *TestSerialization = args.getLastArg(
-      options::OPT_debug_test_dependency_scan_cache_serialization);
 
   if (ExternalDependencyMap && !ScanDependencies) {
     diags.diagnose(SourceLoc(), diag::error_requirement_not_met,
@@ -201,11 +199,6 @@ static void validateDependencyScanningArgs(DiagnosticEngine &diags,
   if (ReuseCache && !ScanDependencies) {
     diags.diagnose(SourceLoc(), diag::error_requirement_not_met,
                    "-load-dependency-scan-cache", "-scan-dependencies");
-  }
-  if (TestSerialization && !ScanDependencies) {
-    diags.diagnose(SourceLoc(), diag::error_requirement_not_met,
-                   "-test-dependency-scan-cache-serialization",
-                   "-scan-dependencies");
   }
   if (SerializeCache && !CacheSerializationPath) {
     diags.diagnose(SourceLoc(), diag::error_requirement_not_met,
@@ -290,6 +283,28 @@ static void validateSearchPathArgs(DiagnosticEngine &diags,
   }
 }
 
+static void validateLinkArgs(DiagnosticEngine &diags, const ArgList &args) {
+  if (args.hasArg(options::OPT_experimental_hermetic_seal_at_link)) {
+    if (args.hasArg(options::OPT_enable_library_evolution)) {
+      diags.diagnose(SourceLoc(),
+                     diag::error_hermetic_seal_cannot_have_library_evolution);
+    }
+
+    bool ltoOk = false;
+    if (const Arg *A = args.getLastArg(options::OPT_lto)) {
+      StringRef name = A->getValue();
+      if (name == "llvm-thin" || name == "llvm-full") {
+        ltoOk = true;
+      }
+    }
+
+    if (!ltoOk) {
+      diags.diagnose(SourceLoc(),
+                     diag::error_hermetic_seal_requires_lto);
+    }
+  }
+}
+
 /// Perform miscellaneous early validation of arguments.
 static void validateArgs(DiagnosticEngine &diags, const ArgList &args,
                          const llvm::Triple &T) {
@@ -301,6 +316,7 @@ static void validateArgs(DiagnosticEngine &diags, const ArgList &args,
   validateCompilationConditionArgs(diags, args);
   validateSearchPathArgs(diags, args);
   validateVerifyIncrementalDependencyArgs(diags, args);
+  validateLinkArgs(diags, args);
 }
 
 std::unique_ptr<ToolChain>
@@ -1448,6 +1464,12 @@ void Driver::buildOutputInfo(const ToolChain &TC, const DerivedArgList &Args,
       Diags.diagnose(SourceLoc(), diag::error_invalid_arg_value,
                      A->getAsString(Args), A->getValue());
   }
+  
+  if (const Arg *A = Args.getLastArg(options::OPT_lto_library)) {
+    OI.LibLTOPath = A->getValue();
+  } else {
+    OI.LibLTOPath = "";
+  }
 
   auto CompilerOutputType = OI.LTOVariant != OutputInfo::LTOKind::None
                              ? file_types::TY_LLVM_BC
@@ -1502,6 +1524,8 @@ void Driver::buildOutputInfo(const ToolChain &TC, const DerivedArgList &Args,
 
     case options::OPT_emit_object:
       OI.CompilerOutputType = file_types::TY_Object;
+      if (OI.LTOVariant != OutputInfo::LTOKind::None)
+        OI.CompilerOutputType = file_types::TY_LLVM_BC;
       break;
 
     case options::OPT_emit_assembly:
@@ -2056,6 +2080,7 @@ void Driver::buildActions(SmallVectorImpl<const Action *> &TopLevelActions,
       case file_types::TY_SwiftOverlayFile:
       case file_types::TY_JSONDependencies:
       case file_types::TY_JSONFeatures:
+      case file_types::TY_SwiftABIDescriptor:
         // We could in theory handle assembly or LLVM input, but let's not.
         // FIXME: What about LTO?
         Diags.diagnose(SourceLoc(), diag::error_unexpected_input_file,
@@ -2760,7 +2785,7 @@ static void addDiagFileOutputForPersistentPCHAction(
     llvm::sys::path::append(outPathBuf, stem);
     outPathBuf += '-';
     auto code = llvm::hash_value(ModuleOutPath);
-    outPathBuf += llvm::APInt(64, code).toString(36, /*Signed=*/false);
+    llvm::APInt(64, code).toString(outPathBuf, 36, /*Signed=*/false);
     llvm::sys::path::replace_extension(outPathBuf, suffix);
   }
 
@@ -3539,7 +3564,7 @@ void Driver::printHelp(bool ShowHidden) const {
   if (!ShowHidden)
     ExcludedFlagsBitmask |= HelpHidden;
 
-  getOpts().PrintHelp(llvm::outs(), Name.c_str(), "Swift compiler",
+  getOpts().printHelp(llvm::outs(), Name.c_str(), "Swift compiler",
                       IncludedFlagsBitmask, ExcludedFlagsBitmask,
                       /*ShowAllAliases*/false);
 

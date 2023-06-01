@@ -1,11 +1,16 @@
-// RUN: %target-typecheck-verify-swift
-// RUN: not %target-swift-frontend -typecheck -debug-generic-signatures %s 2>&1 | %FileCheck %s
+// RUN: %target-typecheck-verify-swift -requirement-machine=on
+// RUN: not %target-swift-frontend -typecheck -debug-generic-signatures -requirement-machine=on %s 2>&1 | %FileCheck %s
 
 
 // Valid example
 struct EquatableBox<T : Equatable> {
   // CHECK: Generic signature: <T, U where T == Array<U>, U : Equatable>
   func withArray<U>(_: U) where T == Array<U> {}
+}
+
+struct EquatableSequenceBox<T : Sequence> where T.Element : Equatable {
+  // CHECK: Generic signature: <T, U where T == Array<Array<U>>, U : Equatable>
+  func withArrayArray<U>(_: U) where T == Array<Array<U>> {}
 }
 
 

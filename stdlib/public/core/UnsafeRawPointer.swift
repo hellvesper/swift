@@ -169,7 +169,7 @@
 ///       let numberPointer = UnsafeRawPointer(&number)
 ///       // Accessing 'numberPointer' is undefined behavior.
 @frozen
-public struct UnsafeRawPointer: _Pointer, Sendable {
+public struct UnsafeRawPointer: _Pointer {
   
   public typealias Pointee = UInt8
   
@@ -355,7 +355,17 @@ public struct UnsafeRawPointer: _Pointer, Sendable {
         & (UInt(MemoryLayout<T>.alignment) - 1)),
       "load from misaligned raw pointer")
 
-    return Builtin.loadRaw((self + offset)._rawValue)
+    let rawPointer = (self + offset)._rawValue
+
+#if compiler(>=5.5) && $BuiltinAssumeAlignment
+    // TODO: to support misaligned raw loads, simply remove this assumption.
+    let alignedPointer =
+      Builtin.assumeAlignment(rawPointer,
+                              MemoryLayout<T>.alignment._builtinWordValue)
+    return Builtin.loadRaw(alignedPointer)
+#else
+  return Builtin.loadRaw(rawPointer)
+#endif
   }
 
 }
@@ -521,7 +531,7 @@ extension UnsafeRawPointer: Strideable {
 ///       let numberPointer = UnsafeMutableRawPointer(&number)
 ///       // Accessing 'numberPointer' is undefined behavior.
 @frozen
-public struct UnsafeMutableRawPointer: _Pointer, Sendable {
+public struct UnsafeMutableRawPointer: _Pointer {
   
   public typealias Pointee = UInt8
   
@@ -600,7 +610,7 @@ public struct UnsafeMutableRawPointer: _Pointer, Sendable {
   /// - Parameters:
   ///   - byteCount: The number of bytes to allocate. `byteCount` must not be negative.
   ///   - alignment: The alignment of the new region of allocated memory, in
-  ///     bytes.
+  ///     bytes. `alignment` must be a whole power of 2.
   /// - Returns: A pointer to a newly allocated region of memory. The memory is
   ///   allocated, but not initialized.
   @inlinable
@@ -901,7 +911,17 @@ public struct UnsafeMutableRawPointer: _Pointer, Sendable {
         & (UInt(MemoryLayout<T>.alignment) - 1)),
       "load from misaligned raw pointer")
 
-    return Builtin.loadRaw((self + offset)._rawValue)
+    let rawPointer = (self + offset)._rawValue
+
+#if compiler(>=5.5) && $BuiltinAssumeAlignment
+    // TODO: to support misaligned raw loads, simply remove this assumption.
+    let alignedPointer =
+      Builtin.assumeAlignment(rawPointer,
+                              MemoryLayout<T>.alignment._builtinWordValue)
+    return Builtin.loadRaw(alignedPointer)
+#else
+    return Builtin.loadRaw(rawPointer)
+#endif
   }
 
   /// Stores the given value's bytes into raw memory at the specified offset.

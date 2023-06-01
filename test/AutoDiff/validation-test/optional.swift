@@ -1,4 +1,5 @@
-// RUN: %target-run-simple-swift
+// RUN: %target-run-simple-swift(-Xfrontend -enable-lexical-borrow-scopes=false)
+
 // REQUIRES: executable_test
 
 // Test differentiation of `Optional` values and operations.

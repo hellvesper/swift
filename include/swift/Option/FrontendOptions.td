@@ -64,6 +64,14 @@ def emit_fixits_path
   : Separate<["-"], "emit-fixits-path">, MetaVarName<"<path>">,
     HelpText<"Output compiler fixits as source edits to <path>">;
 
+def emit_abi_descriptor_path
+  : Separate<["-"], "emit-abi-descriptor-path">, MetaVarName<"<path>">,
+    HelpText<"Output the ABI descriptor of current module to <path>">;
+
+def emit_module_semantic_info_path
+  : Separate<["-"], "emit-module-semantic-info-path">, MetaVarName<"<path>">,
+    HelpText<"Output semantic info of current module to <path>">;
+
 def serialize_module_interface_dependency_hashes
   : Flag<["-"], "serialize-module-interface-dependency-hashes">,
     Flags<[HelpHidden]>;
@@ -134,6 +142,10 @@ def disable_testable_attr_requires_testable_module :
   Flag<["-"], "disable-testable-attr-requires-testable-module">,
   HelpText<"Disable checking of @testable">;
 
+def enable_clang_spi :
+  Flag<["-"], "enable-clang-spi">,
+  HelpText<"Import Clang SPIs as Swift SPIs">;
+
 def enable_target_os_checking :
   Flag<["-"], "enable-target-os-checking">,
   HelpText<"Enable checking the target OS of serialized modules">;
@@ -153,6 +165,10 @@ def print_clang_stats : Flag<["-"], "print-clang-stats">,
 
 def serialize_debugging_options : Flag<["-"], "serialize-debugging-options">,
   HelpText<"Always serialize options for debugging (default: only for apps)">;
+
+def serialized_path_obfuscate : Separate<["-"], "serialized-path-obfuscate">,
+    HelpText<"Remap source paths in debug info">, MetaVarName<"<prefix=replacement>">;
+
 def no_serialize_debugging_options :
   Flag<["-"], "no-serialize-debugging-options">,
   HelpText<"Never serialize options for debugging (default: only for apps)">;
@@ -169,13 +185,9 @@ def disable_typo_correction : Flag<["-"], "disable-typo-correction">,
 def disable_implicit_swift_modules: Flag<["-"], "disable-implicit-swift-modules">,
   HelpText<"Disable building Swift modules implicitly by the compiler">;
 
-def swift_module_file
-  : Separate<["-"], "swift-module-file">, MetaVarName<"<path>">,
-    HelpText<"Specify Swift module explicitly built from textual interface">;
-
-def explict_swift_module_map
+def explicit_swift_module_map
   : Separate<["-"], "explicit-swift-module-map-file">, MetaVarName<"<path>">,
-    HelpText<"Specify a JSON file containing information of explict Swift modules">;
+    HelpText<"Specify a JSON file containing information of explicit Swift modules">;
 
 def placeholder_dependency_module_map
   : Separate<["-"], "placeholder-dependency-module-map-file">, MetaVarName<"<path>">,
@@ -186,7 +198,7 @@ def batch_scan_input_file
     HelpText<"Specify a JSON file containing modules to perform batch dependencies scanning">;
 
 def import_prescan : Flag<["-"], "import-prescan">,
-   HelpText<"When performing a dependency scan, only dentify all imports of the main Swift module sources">;
+   HelpText<"When performing a dependency scan, only identify all imports of the main Swift module sources">;
 
 def serialize_dependency_scan_cache : Flag<["-"], "serialize-dependency-scan-cache">,
    HelpText<"After performing a dependency scan, serialize the scanner's internal state.">;
@@ -201,9 +213,12 @@ def dependency_scan_cache_remarks : Flag<["-"], "Rdependency-scan-cache">,
   HelpText<"Emit remarks indicating use of the serialized module dependency scanning cache.">;
 
 def enable_copy_propagation : Flag<["-"], "enable-copy-propagation">,
-  HelpText<"Run SIL copy propagation to shorten object lifetime.">;
-def disable_copy_propagation : Flag<["-"], "disable-copy-propagation">,
-  HelpText<"Don't run SIL copy propagation to preserve object lifetime.">;
+  HelpText<"Run SIL copy propagation with lexical lifetimes to shorten object "
+           "lifetimes while preserving variable lifetimes.">;
+def copy_propagation_state_EQ :
+  Joined<["-"], "enable-copy-propagation=">,
+  HelpText<"Whether to enable copy propagation">,
+  MetaVarName<"true|requested-passes-only|false">;
 
 def enable_infer_public_concurrent_value : Flag<["-"], "enable-infer-public-sendable">,
     HelpText<"Enable inference of Sendable conformances for public structs and enums">;
@@ -247,6 +262,23 @@ def enable_experimental_concurrency :
   Flag<["-"], "enable-experimental-concurrency">,
   HelpText<"Enable experimental concurrency model">;
 
+def enable_lexical_borrow_scopes :
+  Joined<["-"], "enable-lexical-borrow-scopes=">,
+  HelpText<"Whether to emit lexical borrow scopes (default: true)">,
+  MetaVarName<"true|false">;
+          
+def enable_lexical_lifetimes :
+  Joined<["-"], "enable-lexical-lifetimes=">,
+  HelpText<"Whether to enable lexical lifetimes">,
+  MetaVarName<"true|false">;
+def enable_lexical_lifetimes_noArg :
+  Flag<["-"], "enable-lexical-lifetimes">,
+  HelpText<"Enable lexical lifetimes">;
+
+def enable_experimental_move_only :
+  Flag<["-"], "enable-experimental-move-only">,
+  HelpText<"Enable experimental move only">;
+
 def enable_experimental_distributed :
   Flag<["-"], "enable-experimental-distributed">,
   HelpText<"Enable experimental 'distributed' actors and functions">;
@@ -277,14 +309,15 @@ def debug_constraints_on_line_EQ : Joined<["-"], "debug-constraints-on-line=">,
 def disable_named_lazy_member_loading : Flag<["-"], "disable-named-lazy-member-loading">,
   HelpText<"Disable per-name lazy member loading">;
 
-def enable_requirement_machine : Flag<["-"], "enable-requirement-machine">,
-  HelpText<"Enable experimental generics implementation">;
+def dump_requirement_machine : Flag<["-"], "dump-requirement-machine">,
+  HelpText<"Enables dumping rewrite systems from the generics implementation">;
 
-def disable_requirement_machine : Flag<["-"], "disable-requirement-machine">,
-  HelpText<"Disable experimental generics implementation">;
+def debug_requirement_machine : Joined<["-"], "debug-requirement-machine=">,
+  HelpText<"Fine-grained debug output from the generics implementation">;
 
-def debug_requirement_machine : Flag<["-"], "debug-requirement-machine">,
-  HelpText<"Enables debugging output from the generics implementation">;
+def analyze_requirement_machine : Flag<["-"], "analyze-requirement-machine">,
+  Flags<[FrontendOption, HelpHidden, DoesNotAffectIncrementalBuild]>,
+  HelpText<"Print out requirement machine statistics at the end of the compilation job">;
 
 def requirement_machine_step_limit : Separate<["-"], "requirement-machine-step-limit">,
   Flags<[FrontendOption, HelpHidden, DoesNotAffectIncrementalBuild]>,
@@ -437,9 +470,25 @@ def enable_experimental_static_assert :
   Flag<["-"], "enable-experimental-static-assert">,
   HelpText<"Enable experimental #assert">;
 
-def enable_experimental_opaque_return_types :
-  Flag<["-"], "enable-experimental-opaque-return-types">,
-  HelpText<"Enable experimental extensions to opaque return type support">;
+def disable_subst_sil_function_types :
+  Flag<["-"], "disable-subst-sil-function-types">,
+  HelpText<"Disable substituted function types for SIL type lowering of function values">;
+
+def enable_experimental_named_opaque_types :
+  Flag<["-"], "enable-experimental-named-opaque-types">,
+  HelpText<"Enable experimental support for named opaque result types">;
+
+def enable_experimental_structural_opaque_types :
+  Flag<["-"], "enable-experimental-structural-opaque-types">,
+  HelpText<"Enable experimental support for structural opaque result types">;
+
+def enable_explicit_existential_types :
+  Flag<["-"], "enable-explicit-existential-types">,
+  HelpText<"Enable experimental support for explicit existential types">;
+
+def enable_experimental_universal_existentials :
+  Flag<["-"], "enable-experimental-universal-existentials">,
+  HelpText<"Enable experimental support for universal existential types">;
 
 def enable_deserialization_recovery :
   Flag<["-"], "enable-deserialization-recovery">,
@@ -447,6 +496,10 @@ def enable_deserialization_recovery :
 def disable_deserialization_recovery :
   Flag<["-"], "disable-deserialization-recovery">,
   HelpText<"Don't attempt to recover from missing xrefs (etc) in swiftmodules">;
+
+def enable_experimental_string_processing :
+  Flag<["-"], "enable-experimental-string-processing">,
+  HelpText<"Enable experimental string processing">;
 
 def disable_availability_checking : Flag<["-"],
   "disable-availability-checking">,
@@ -464,6 +517,10 @@ def warn_on_potentially_unavailable_enum_case : Flag<["-"],
   "warn-on-potentially-unavailable-enum-case">,
   HelpText<"Downgrade potential unavailability of enum case to a warning">;
 
+def warn_on_editor_placeholder : Flag<["-"],
+  "warn-on-editor-placeholder">,
+  HelpText<"Downgrade the editor placeholder error to a warning">;
+
 def report_errors_to_debugger : Flag<["-"], "report-errors-to-debugger">,
   HelpText<"Deprecated, will be removed in future versions.">;
 
@@ -476,14 +533,27 @@ def disable_swift3_objc_inference :
   Flags<[FrontendOption, HelpHidden]>,
   HelpText<"Disable Swift 3's @objc inference rules for NSObject-derived classes and 'dynamic' members (emulates Swift 4 behavior)">;
 
-def library_level : Separate<["-"], "library-level">,
-  MetaVarName<"<level>">,
-  Flags<[FrontendOption, ModuleInterfaceOption]>,
-  HelpText<"Library distribution level 'api', 'spi' or 'other' (the default)">;
-
 def enable_implicit_dynamic : Flag<["-"], "enable-implicit-dynamic">,
   Flags<[FrontendOption, NoInteractiveOption, HelpHidden]>,
   HelpText<"Add 'dynamic' to all declarations">;
+
+def enable_llvm_vfe : Flag<["-"], "enable-llvm-vfe">,
+  Flags<[FrontendOption, NoInteractiveOption, HelpHidden]>,
+  HelpText<"Use LLVM IR Virtual Function Elimination on Swift class virtual tables">;
+
+def enable_llvm_wme : Flag<["-"], "enable-llvm-wme">,
+  Flags<[FrontendOption, NoInteractiveOption, HelpHidden]>,
+  HelpText<"Use LLVM IR Witness Method Elimination on Swift protocol witness tables">;
+
+def internalize_at_link : Flag<["-"], "internalize-at-link">,
+  Flags<[FrontendOption, NoInteractiveOption, HelpHidden]>,
+  HelpText<"Allow internalizing public symbols and vtables at link time (assume"
+  " all client code of public types is part of the same link unit, or that"
+  " external symbols are explicitly requested via -exported_symbols_list)">;
+
+def conditional_runtime_records : Flag<["-"], "conditional-runtime-records">,
+  Flags<[FrontendOption, NoInteractiveOption, HelpHidden]>,
+  HelpText<"Allow removal of runtime metadata records (public types, protocol conformances) based on whether they're used or unused">;
 
 def disable_previous_implementation_calls_in_dynamic_replacements :
   Flag<["-"], "disable-previous-implementation-calls-in-dynamic-replacements">,
@@ -523,6 +593,9 @@ def warn_long_expression_type_checking_EQ : Joined<["-"], "warn-long-expression-
 
 def Rmodule_interface_rebuild : Flag<["-"], "Rmodule-interface-rebuild">,
   HelpText<"Emits a remark if an imported module needs to be re-compiled from its module interface">;
+
+def downgrade_typecheck_interface_error : Flag<["-"], "downgrade-typecheck-interface-error">,
+  HelpText<"Downgrade error to warning when typechecking emitted module interfaces">;
 
 def enable_volatile_modules : Flag<["-"], "enable-volatile-modules">,
   HelpText<"Load Swift modules in memory">;
@@ -588,6 +661,10 @@ def disable_debugger_shadow_copies : Flag<["-"], "disable-debugger-shadow-copies
 
 def disable_concrete_type_metadata_mangled_name_accessors : Flag<["-"], "disable-concrete-type-metadata-mangled-name-accessors">,
   HelpText<"Disable concrete type metadata access by mangled name">,
+  Flags<[FrontendOption, HelpHidden]>;
+
+def disable_standard_substitutions_in_reflection_mangling : Flag<["-"], "disable-standard-substitutions-in-reflection-mangling">,
+  HelpText<"Disable referencing stdlib symbols via mangled names in reflection mangling">,
   Flags<[FrontendOption, HelpHidden]>;
   
 def playground : Flag<["-"], "playground">,
@@ -737,6 +814,10 @@ def experimental_one_way_closure_params :
   Flag<["-"], "experimental-one-way-closure-params">,
   HelpText<"Enable experimental support for one-way closure parameters">;
 
+def experimental_multi_statement_closures :
+  Flag<["-"], "experimental-multi-statement-closures">,
+  HelpText<"Enable experimental support for type inference in multi-statement closures">;
+
 def prebuilt_module_cache_path :
   Separate<["-"], "prebuilt-module-cache-path">,
   HelpText<"Directory of prebuilt modules for loading module interfaces">;
@@ -774,7 +855,7 @@ def enable_verify_exclusivity : Flag<["-"], "enable-verify-exclusivity">,
   HelpText<"Enable verification of access markers used to enforce exclusivity.">;
 
 def disable_verify_exclusivity : Flag<["-"], "disable-verify-exclusivity">,
-  HelpText<"Diable verification of access markers used to enforce exclusivity.">;
+  HelpText<"Disable verification of access markers used to enforce exclusivity.">;
 
 def disable_legacy_type_info : Flag<["-"], "disable-legacy-type-info">,
   HelpText<"Completely disable legacy type layout">;
@@ -794,9 +875,9 @@ def type_info_dump_filter_EQ : Joined<["-"], "type-info-dump-filter=">,
   Flags<[FrontendOption]>,
   HelpText<"One of 'all', 'resilient' or 'fragile'">;
 
-def emit_ldadd_cfile_path
-  : Separate<["-"], "emit-ldadd-cfile-path">, MetaVarName<"<path>">,
-    HelpText<"Generate .c file defining symbols to add back">;
+def swift_async_frame_pointer_EQ : Joined<["-"], "swift-async-frame-pointer=">,
+  Flags<[FrontendOption]>,
+  HelpText<"One of 'auto', 'always' or 'never'">;
 
 def previous_module_installname_map_file
   : Separate<["-"], "previous-module-installname-map-file">, MetaVarName<"<path>">,
@@ -807,6 +888,9 @@ def enable_type_layouts : Flag<["-"], "enable-type-layout">,
 
 def disable_type_layouts : Flag<["-"], "disable-type-layout">,
   HelpText<"Disable type layout based lowering">;
+
+def force_struct_type_layouts : Flag<["-"], "force-struct-type-layouts">,
+  HelpText<"Force type layout based lowering for structs">;
 
 def disable_interface_lockfile : Flag<["-"], "disable-interface-lock">,
   HelpText<"Don't lock interface file when building module">;
@@ -822,6 +906,9 @@ def target_sdk_version : Separate<["-"], "target-sdk-version">,
 
 def target_variant_sdk_version : Separate<["-"], "target-variant-sdk-version">,
   HelpText<"The version of target variant SDK used for compilation">;
+
+def target_sdk_name : Separate<["-"], "target-sdk-name">,
+  HelpText<"Canonical name of the target SDK used for compilation">;
 
 def extra_clang_options_only : Flag<["-"], "only-use-extra-clang-opts">,
   HelpText<"Options passed via -Xcc are sufficient for Clang configuration">;

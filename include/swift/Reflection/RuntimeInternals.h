@@ -21,6 +21,8 @@
 #ifndef SWIFT_REFLECTION_RUNTIME_INTERNALS_H
 #define SWIFT_REFLECTION_RUNTIME_INTERNALS_H
 
+#include <stdint.h>
+
 namespace swift {
 
 namespace reflection {
@@ -84,6 +86,7 @@ struct StackAllocator {
   bool FirstSlabIsPreallocated;
 
   struct Slab {
+    typename Runtime::StoredPointer Metadata;
     typename Runtime::StoredPointer Next;
     uint32_t Capacity;
     uint32_t CurrentOffset;
@@ -91,8 +94,14 @@ struct StackAllocator {
 };
 
 template <typename Runtime>
+struct ActiveTaskStatus {
+  typename Runtime::StoredPointer Record;
+  typename Runtime::StoredSize Flags;
+};
+
+template <typename Runtime>
 struct AsyncTaskPrivateStorage {
-  typename Runtime::StoredSize Status;
+  ActiveTaskStatus<Runtime> Status;
   StackAllocator<Runtime> Allocator;
   typename Runtime::StoredPointer Local;
 };

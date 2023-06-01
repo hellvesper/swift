@@ -28,7 +28,6 @@ class TypeRepr;
 class ComponentIdentTypeRepr;
 class GenericEnvironment;
 class GenericSignature;
-class GenericSignatureBuilder;
 
 /// Flags that describe the context of type checking a pattern or
 /// type.
@@ -126,6 +125,16 @@ enum class TypeResolverContext : uint8_t {
   /// Whether we are in a requirement of a generic declaration
   GenericRequirement,
 
+  /// Whether we are in a same-type requirement of a generic
+  /// declaration.
+  SameTypeRequirement,
+
+  /// Whether this is the base type of .Protocol
+  ProtocolMetatypeBase,
+
+  /// Whether this is the base type of .Type
+  MetatypeBase,
+
   /// Whether we are in a type argument for an optional
   ImmediateOptionalTypeArgument,
 
@@ -134,6 +143,9 @@ enum class TypeResolverContext : uint8_t {
 
   /// Whether this is an "inherited" type.
   Inherited,
+
+  /// Whether this is a custom attribute.
+  CustomAttr
 };
 
 /// Options that determine how type resolution should work.
@@ -213,12 +225,50 @@ public:
     case Context::TypeAliasDecl:
     case Context::GenericTypeAliasDecl:
     case Context::GenericRequirement:
+    case Context::SameTypeRequirement:
+    case Context::ProtocolMetatypeBase:
+    case Context::MetatypeBase:
     case Context::ImmediateOptionalTypeArgument:
     case Context::AbstractFunctionDecl:
     case Context::Inherited:
+    case Context::CustomAttr:
       return false;
     }
     llvm_unreachable("unhandled kind");
+  }
+
+  /// Whether a generic constraint type is implicitly an
+  /// existential type in this context.
+  bool isConstraintImplicitExistential() const {
+    switch (context) {
+    case Context::Inherited:
+    case Context::ExtensionBinding:
+    case Context::TypeAliasDecl:
+    case Context::GenericTypeAliasDecl:
+    case Context::GenericRequirement:
+    case Context::MetatypeBase:
+      return false;
+    case Context::None:
+    case Context::InExpression:
+    case Context::ExplicitCastExpr:
+    case Context::ForEachStmt:
+    case Context::PatternBindingDecl:
+    case Context::EditorPlaceholderExpr:
+    case Context::ClosureExpr:
+    case Context::FunctionInput:
+    case Context::VariadicFunctionInput:
+    case Context::InoutFunctionInput:
+    case Context::FunctionResult:
+    case Context::SubscriptDecl:
+    case Context::EnumElementDecl:
+    case Context::EnumPatternPayload:
+    case Context::SameTypeRequirement:
+    case Context::ProtocolMetatypeBase:
+    case Context::ImmediateOptionalTypeArgument:
+    case Context::AbstractFunctionDecl:
+    case Context::CustomAttr:
+      return true;
+    }
   }
 
   /// Determine whether all of the given options are set.
@@ -273,6 +323,13 @@ public:
     if (!preserveSIL) copy -= TypeResolutionFlags::SILType;
     return copy;
   }
+
+  inline
+  TypeResolutionOptions withContext(TypeResolverContext context) const {
+    auto copy = *this;
+    copy.setContext(context);
+    return copy;
+  }
 };
 
 /// A function reference used to "open" the given unbound generic type
@@ -297,20 +354,8 @@ class TypeResolution {
   HandlePlaceholderTypeReprFn placeholderHandler;
 
 private:
-  union {
-    /// The generic environment used to map to archetypes.
-    GenericEnvironment *genericEnv;
-
-    /// The generic signature
-    struct {
-      /// The generic signature to use for type resolution.
-      GenericSignature genericSig;
-
-      /// The generic signature builder that will answer queries about
-      /// generic types.
-      mutable GenericSignatureBuilder *builder;
-    } complete;
-  };
+  /// The generic environment used to map to archetypes.
+  GenericEnvironment *genericEnv;
 
   TypeResolution(DeclContext *dc, TypeResolutionStage stage,
                  TypeResolutionOptions options,
@@ -318,13 +363,8 @@ private:
                  HandlePlaceholderTypeReprFn placeholderHandler)
       : dc(dc), stage(stage), options(options),
         unboundTyOpener(unboundTyOpener),
-        placeholderHandler(placeholderHandler) {}
-
-  GenericSignatureBuilder *getGenericSignatureBuilder() const;
-
-  /// Retrieves the generic signature for the context, or NULL if there is
-  /// no generic signature to resolve types.
-  GenericSignature getGenericSignature() const;
+        placeholderHandler(placeholderHandler),
+        genericEnv(nullptr) {}
 
 public:
   /// Form a type resolution for the structure of a type, which does not
@@ -342,22 +382,29 @@ public:
                OpenUnboundGenericTypeFn unboundTyOpener,
                HandlePlaceholderTypeReprFn placeholderHandler);
 
-  /// Form a type resolution for a contextual type, which is a complete
-  /// description of the type using the archetypes of the given declaration
-  /// context.
+  /// Form a type resolution for an interface type, which is a complete
+  /// description of the type using generic parameters.
   static TypeResolution
-  forContextual(DeclContext *dc, TypeResolutionOptions opts,
-                OpenUnboundGenericTypeFn unboundTyOpener,
-                HandlePlaceholderTypeReprFn placeholderHandler);
+  forInterface(DeclContext *dc, GenericEnvironment *genericEnv,
+               TypeResolutionOptions opts,
+               OpenUnboundGenericTypeFn unboundTyOpener,
+               HandlePlaceholderTypeReprFn placeholderHandler);
 
   /// Form a type resolution for a contextual type, which is a complete
   /// description of the type using the archetypes of the given generic
   /// environment.
-  static TypeResolution
-  forContextual(DeclContext *dc, GenericEnvironment *genericEnv,
-                TypeResolutionOptions opts,
-                OpenUnboundGenericTypeFn unboundTyOpener,
-                HandlePlaceholderTypeReprFn placeholderHandler);
+  static Type
+  resolveContextualType(TypeRepr *TyR, DeclContext *dc,
+                        TypeResolutionOptions opts,
+                        OpenUnboundGenericTypeFn unboundTyOpener,
+                        HandlePlaceholderTypeReprFn placeholderHandler,
+                        GenericParamList *silParams = nullptr);
+
+  static Type resolveContextualType(
+      TypeRepr *TyR, DeclContext *dc, GenericEnvironment *genericEnv,
+      TypeResolutionOptions opts, OpenUnboundGenericTypeFn unboundTyOpener,
+      HandlePlaceholderTypeReprFn placeholderHandler,
+      GenericParamList *silParams = nullptr);
 
 public:
   TypeResolution withOptions(TypeResolutionOptions opts) const;
@@ -383,6 +430,10 @@ public:
     return placeholderHandler;
   }
 
+  /// Retrieves the generic signature for the context, or NULL if there is
+  /// no generic signature to resolve types.
+  GenericSignature getGenericSignature() const;
+
   /// Resolves a TypeRepr to a type.
   ///
   /// Performs name lookup, checking of generic arguments, and so on in order
@@ -394,12 +445,6 @@ public:
   /// \returns A well-formed type that is never null, or an \c ErrorType in case of an error.
   Type resolveType(TypeRepr *TyR,
                    GenericParamList *silParams=nullptr) const;
-
-  /// Whether this type resolution uses archetypes (vs. generic parameters).
-  bool usesArchetypes() const;
-
-  /// Map the given type (that involves generic parameters)
-  Type mapTypeIntoContext(Type type) const;
 
   /// Resolve a reference to a member type of the given (dependent) base and
   /// name.

@@ -86,7 +86,7 @@ class ReferencedTypeFinder : public TypeDeclFinder {
     auto sig = decl->getGenericSignature();
 
     for_each(boundGeneric->getGenericArgs(),
-             sig->getInnermostGenericParams(),
+             sig.getInnermostGenericParams(),
              [&](Type argTy, GenericTypeParamType *paramTy) {
       // FIXME: I think there's a bug here with recursive generic types.
       if (isObjCGeneric && isConstrained(sig, paramTy))
@@ -235,6 +235,30 @@ public:
     });
   }
 
+  void forwardDeclareType(const TypeDecl *TD) {
+    if (auto CD = dyn_cast<ClassDecl>(TD)) {
+      if (!forwardDeclare(CD)) {
+        (void)addImport(CD);
+      }
+    } else if (auto PD = dyn_cast<ProtocolDecl>(TD)) {
+      forwardDeclare(PD);
+    } else if (auto TAD = dyn_cast<TypeAliasDecl>(TD)) {
+      bool imported = false;
+      if (TAD->hasClangNode())
+        imported = addImport(TD);
+      assert((imported || !TAD->isGeneric()) &&
+             "referencing non-imported generic typealias?");
+    } else if (addImport(TD)) {
+      return;
+    } else if (auto ED = dyn_cast<EnumDecl>(TD)) {
+      forwardDeclare(ED);
+    } else if (isa<AbstractTypeParamDecl>(TD)) {
+      llvm_unreachable("should not see type params here");
+    } else {
+      assert(false && "unknown local type decl");
+    }
+  }
+
   bool forwardDeclareMemberTypes(DeclRange members, const Decl *container) {
     PrettyStackTraceDecl
         entry("printing forward declarations needed by members of", container);
@@ -312,26 +336,7 @@ public:
           // FIXME: It would be nice to diagnose this.
         }
 
-        if (auto CD = dyn_cast<ClassDecl>(TD)) {
-          if (!forwardDeclare(CD)) {
-            (void)addImport(CD);
-          }
-        } else if (auto PD = dyn_cast<ProtocolDecl>(TD)) {
-          forwardDeclare(PD);
-        } else if (auto TAD = dyn_cast<TypeAliasDecl>(TD)) {
-          bool imported = false;
-          if (TAD->hasClangNode())
-            imported = addImport(TD);
-          assert((imported || !TAD->isGeneric()) && "referencing non-imported generic typealias?");
-        } else if (addImport(TD)) {
-          return;
-        } else if (auto ED = dyn_cast<EnumDecl>(TD)) {
-          forwardDeclare(ED);
-        } else if (isa<AbstractTypeParamDecl>(TD)) {
-          llvm_unreachable("should not see type params here");
-        } else {
-          assert(false && "unknown local type decl");
-        }
+        forwardDeclareType(TD);
       });
 
       if (needsToBeIndividuallyDelayed) {
@@ -374,11 +379,22 @@ public:
     printer.print(CD);
     return true;
   }
-  
+
   bool writeFunc(const FuncDecl *FD) {
     if (addImport(FD))
       return true;
 
+    PrettyStackTraceDecl entry(
+        "printing forward declarations needed by function", FD);
+    ReferencedTypeFinder::walk(
+        FD->getInterfaceType(),
+        [&](ReferencedTypeFinder &finder, const TypeDecl *TD) {
+          PrettyStackTraceDecl entry("walking its interface type, currently at",
+                                     TD);
+          forwardDeclareType(TD);
+        });
+
+    os << '\n';
     printer.print(FD);
     return true;
   }
@@ -449,7 +465,7 @@ public:
 
     SmallVector<ProtocolConformance *, 1> conformances;
     auto errorTypeProto = ctx.getProtocol(KnownProtocolKind::Error);
-    if (ED->lookupConformance(&M, errorTypeProto, conformances)) {
+    if (ED->lookupConformance(errorTypeProto, conformances)) {
       bool hasDomainCase = std::any_of(ED->getAllElements().begin(),
                                        ED->getAllElements().end(),
                                        [](const EnumElementDecl *elem) {
@@ -598,6 +614,8 @@ public:
 void
 swift::printModuleContentsAsObjC(raw_ostream &os,
                                  llvm::SmallPtrSetImpl<ImportModuleTy> &imports,
-                                 ModuleDecl &M, AccessLevel minRequiredAccess) {
-  ModuleWriter(os, imports, M, minRequiredAccess).write();
+                                 ModuleDecl &M) {
+  auto requiredAccess = M.isExternallyConsumed() ? AccessLevel::Public
+                                                 : AccessLevel::Internal;
+  ModuleWriter(os, imports, M, requiredAccess).write();
 }

@@ -33,6 +33,26 @@
 
 using namespace swift;
 
+void
+swift::getTopLevelDeclsForDisplay(ModuleDecl *M,
+                                  SmallVectorImpl<Decl*> &Results,
+                                  bool Recursive) {
+  auto startingSize = Results.size();
+  M->getDisplayDecls(Results, Recursive);
+
+  // Force Sendable on all types, which might synthesize some extensions.
+  // FIXME: We can remove this if @_nonSendable stops creating extensions.
+  for (auto result : Results) {
+    if (auto NTD = dyn_cast<NominalTypeDecl>(result))
+      (void)swift::isSendableType(M, NTD->getDeclaredInterfaceType());
+  }
+
+  // Remove what we fetched and fetch again, possibly now with additional
+  // extensions.
+  Results.resize(startingSize);
+  M->getDisplayDecls(Results, Recursive);
+}
+
 static bool shouldPrintAsFavorable(const Decl *D, const PrintOptions &Options) {
   if (!Options.TransformContext ||
       !isa<ExtensionDecl>(D->getDeclContext()) ||
@@ -354,7 +374,7 @@ struct SynthesizedExtensionAnalyzer::Implementation {
 
       assert(Ext->getGenericSignature() && "No generic signature.");
       auto GenericSig = Ext->getGenericSignature();
-      if (handleRequirements(subMap, Ext, GenericSig->getRequirements()))
+      if (handleRequirements(subMap, Ext, GenericSig.getRequirements()))
         return {Result, MergeInfo};
     }
 

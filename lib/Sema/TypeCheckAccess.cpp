@@ -783,7 +783,12 @@ public:
                               Type());
     }
 
-    auto declKindForType = [](Type type) {
+    auto declKindForType = [](Type type) -> DescriptiveDeclKind {
+      // If this is an existential type, use the decl kind of
+      // its constraint type.
+      if (auto existential = type->getAs<ExistentialType>())
+        type = existential->getConstraintType();
+
       if (isa<TypeAliasType>(type.getPointer()))
         return DescriptiveDeclKind::TypeAlias;
       else if (auto nominal = type->getAnyNominal())
@@ -1548,7 +1553,7 @@ swift::getDisallowedOriginKind(const Decl *decl,
   }
 
   return DisallowedOriginKind::None;
-};
+}
 
 namespace {
 
@@ -1640,6 +1645,7 @@ public:
   // "name: TheType" form, we can get better results by diagnosing the TypeRepr.
   UNINTERESTING(Var)
 
+
   /// \see visitPatternBindingDecl
   void checkNamedPattern(const NamedPattern *NP,
                          const llvm::DenseSet<const VarDecl *> &seenVars) {
@@ -1685,6 +1691,9 @@ public:
   }
 
   void visitPatternBindingDecl(PatternBindingDecl *PBD) {
+    if (!shouldCheckAvailability(PBD->getAnchoringVarDecl(0)))
+      return;
+
     llvm::DenseSet<const VarDecl *> seenVars;
     for (auto idx : range(PBD->getNumPatternEntries())) {
       PBD->getPattern(idx)->forEachNode([&](const Pattern *P) {
@@ -1874,12 +1883,10 @@ public:
   }
 
   void visitInfixOperatorDecl(InfixOperatorDecl *IOD) {
-    // FIXME: Handle operator designated types (which also applies to prefix
-    // and postfix operators).
     if (auto *precedenceGroup = IOD->getPrecedenceGroup()) {
-      if (!IOD->getIdentifiers().empty()) {
+      if (!IOD->getPrecedenceGroupName().empty()) {
         checkPrecedenceGroup(precedenceGroup, IOD, IOD->getLoc(),
-                             IOD->getIdentifiers().front().Loc);
+                             IOD->getPrecedenceGroupLoc());
       }
     }
   }
@@ -1954,5 +1961,22 @@ void swift::checkAccessControl(Decl *D) {
   if (where.isImplicit())
     return;
 
+  if (!shouldCheckAvailability(D))
+    return;
+
   DeclAvailabilityChecker(where).visit(D);
+}
+
+bool swift::shouldCheckAvailability(const Decl *D) {
+  if (D && D->getASTContext().LangOpts.CheckAPIAvailabilityOnly) {
+    // Skip whole decl if not API-public.
+    if (auto valueDecl = dyn_cast<const ValueDecl>(D)) {
+      AccessScope scope =
+        valueDecl->getFormalAccessScope(/*useDC*/nullptr,
+                                        /*treatUsableFromInlineAsPublic*/true);
+      if (!scope.isPublic())
+        return false;
+    }
+  }
+  return true;
 }

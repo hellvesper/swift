@@ -573,7 +573,7 @@ func r22263468(_ a : String?) {
   // TODO(diagnostics): This is a regression from diagnosing missing optional unwrap for `a`, we have to
   // re-think the way errors in tuple elements are detected because it's currently impossible to detect
   // exactly what went wrong here and aggregate fixes for different elements at the same time.
-  _ = MyTuple(42, a) // expected-error {{tuple type '(Int, String?)' is not convertible to tuple type 'MyTuple' (aka '(Int, String)')}}
+  _ = MyTuple(42, a) // expected-error {{tuple type '(_const Int, String?)' is not convertible to tuple type 'MyTuple' (aka '(Int, String)')}}
 }
 
 // rdar://71829040 - "ambiguous without more context" error for tuple type mismatch.
@@ -1137,7 +1137,7 @@ func badTypes() {
 // rdar://34357545
 func unresolvedTypeExistential() -> Bool {
   return (Int.self==_{})
-  // expected-error@-1 {{'_' can only appear in a pattern or on the left side of an assignment}}
+  // expected-error@-1 {{type of expression is ambiguous without more context}}
 }
 
 do {
@@ -1219,12 +1219,14 @@ func voidFuncWithEffects1() throws {
   // expected-note@-2 {{did you mean to add a return type?}}{{35-35= -> <#Return Type#>}}
 }
 
+@available(SwiftStdlib 5.5, *)
 func voidFuncWithEffects2() async throws {
   return 1
   // expected-error@-1 {{unexpected non-void return value in void function}}
   // expected-note@-2 {{did you mean to add a return type?}}{{41-41= -> <#Return Type#>}}
 }
 
+@available(SwiftStdlib 5.5, *)
 // expected-error@+1 {{'async' must precede 'throws'}}
 func voidFuncWithEffects3() throws async {
   return 1
@@ -1232,6 +1234,7 @@ func voidFuncWithEffects3() throws async {
   // expected-note@-2 {{did you mean to add a return type?}}{{41-41= -> <#Return Type#>}}
 }
 
+@available(SwiftStdlib 5.5, *)
 func voidFuncWithEffects4() async {
   return 1
   // expected-error@-1 {{unexpected non-void return value in void function}}
@@ -1244,6 +1247,7 @@ func voidFuncWithEffects5(_ closure: () throws -> Void) rethrows {
   // expected-note@-2 {{did you mean to add a return type?}}{{65-65= -> <#Return Type#>}}
 }
 
+@available(SwiftStdlib 5.5, *)
 func voidGenericFuncWithEffects<T>(arg: T) async where T: CustomStringConvertible {
   return 1
   // expected-error@-1 {{unexpected non-void return value in void function}}
@@ -1410,4 +1414,78 @@ func rdar74696023() {
     // expected-note@-1 {{coalesce using '??' to provide a default when the optional value contains 'nil'}}
     // expected-note@-2 {{force-unwrap using '!' to abort execution if the optional value contains 'nil'}}
   }
+}
+
+extension Int {
+  static var optionalIntMember: Int? { 0 }
+  static var optionalThrowsMember: Int? { get throws { 0 } }
+}
+
+func testUnwrapFixIts(x: Int?) throws {
+  let _ = x + 2 // expected-error {{value of optional type 'Int?' must be unwrapped to a value of type 'Int'}}
+  // expected-note@-1 {{coalesce using '??' to provide a default when the optional value contains 'nil'}} {{11-11=(}} {{12-12= ?? <#default value#>)}}
+  // expected-note@-2 {{force-unwrap using '!' to abort execution if the optional value contains 'nil'}} {{12-12=!}}
+  let _ = (x ?? 0) + 2
+
+  let _ = 2 + x // expected-error {{value of optional type 'Int?' must be unwrapped to a value of type 'Int'}}
+  // expected-note@-1 {{coalesce using '??' to provide a default when the optional value contains 'nil'}} {{15-15=(}} {{16-16= ?? <#default value#>)}}
+  // expected-note@-2 {{force-unwrap using '!' to abort execution if the optional value contains 'nil'}} {{16-16=!}}
+  let _ = 2 + (x ?? 0)
+
+  func foo(y: Int) {}
+  foo(y: x) // expected-error {{value of optional type 'Int?' must be unwrapped to a value of type 'Int'}}
+  // expected-note@-1 {{coalesce using '??' to provide a default when the optional value contains 'nil'}} {{11-11= ?? <#default value#>}}
+  // expected-note@-2 {{force-unwrap using '!' to abort execution if the optional value contains 'nil'}} {{11-11=!}}
+  foo(y: x ?? 0) 
+
+  let _ = x < 2 // expected-error {{value of optional type 'Int?' must be unwrapped to a value of type 'Int'}}
+  // expected-note@-1 {{coalesce using '??' to provide a default when the optional value contains 'nil'}} {{12-12= ?? <#default value#>}}
+  // expected-note@-2 {{force-unwrap using '!' to abort execution if the optional value contains 'nil'}} {{12-12=!}}
+  let _ = x ?? 0 < 2
+
+  let _ = 2 < x // expected-error {{value of optional type 'Int?' must be unwrapped to a value of type 'Int'}}
+  // expected-note@-1 {{coalesce using '??' to provide a default when the optional value contains 'nil'}} {{16-16= ?? <#default value#>}}
+  // expected-note@-2 {{force-unwrap using '!' to abort execution if the optional value contains 'nil'}} {{16-16=!}}
+  let _ = 2 < x ?? 0
+
+  let _: Int = (.optionalIntMember) // expected-error {{value of optional type 'Int?' must be unwrapped to a value of type 'Int'}}
+  // expected-note@-1 {{coalesce using '??' to provide a default when the optional value contains 'nil'}} {{35-35= ?? <#default value#>}}
+  // expected-note@-2 {{force-unwrap using '!' to abort execution if the optional value contains 'nil'}} {{35-35=!}}
+  let _: Int = (.optionalIntMember ?? 0)
+
+  let _ = 1 + .optionalIntMember // expected-error {{value of optional type 'Int?' must be unwrapped to a value of type 'Int'}}
+  // expected-note@-1 {{coalesce using '??' to provide a default when the optional value contains 'nil'}} {{15-15=(}} {{33-33= ?? <#default value#>)}}
+  // expected-note@-2 {{force-unwrap using '!' to abort execution if the optional value contains 'nil'}} {{33-33=!}}
+  let _ = 1 + (.optionalIntMember ?? 0)
+
+  let _ = try .optionalThrowsMember + 1 // expected-error {{value of optional type 'Int?' must be unwrapped to a value of type 'Int'}}
+  // expected-note@-1 {{coalesce using '??' to provide a default when the optional value contains 'nil'}} {{15-15=(}} {{36-36= ?? <#default value#>)}}
+  // expected-note@-2 {{force-unwrap using '!' to abort execution if the optional value contains 'nil'}} {{36-36=!}}
+  let _ = try (.optionalThrowsMember ?? 0) + 1
+
+  let _ = .optionalIntMember?.bitWidth > 0 // expected-error {{value of optional type 'Int?' must be unwrapped to a value of type 'Int'}}
+  // expected-note@-1 {{coalesce using '??' to provide a default when the optional value contains 'nil'}} {{39-39= ?? <#default value#>}}
+  // expected-note@-2 {{force-unwrap using '!' to abort execution if the optional value contains 'nil'}} {{11-11=(}} {{39-39=)!}}
+  let _ = (.optionalIntMember?.bitWidth)! > 0
+  let _ = .optionalIntMember?.bitWidth ?? 0 > 0
+
+  let _ = .random() ? .optionalIntMember : 0 // expected-error {{value of optional type 'Int?' must be unwrapped to a value of type 'Int'}}
+  // expected-note@-1 {{coalesce using '??' to provide a default when the optional value contains 'nil'}} {{41-41= ?? <#default value#>}}
+  // expected-note@-2 {{force-unwrap using '!' to abort execution if the optional value contains 'nil'}} {{41-41=!}}
+  let _ = .random() ? .optionalIntMember ?? 0 : 0
+
+  let _: Int = try try try .optionalThrowsMember // expected-error {{value of optional type 'Int?' must be unwrapped to a value of type 'Int'}}
+  // expected-note@-1 {{coalesce using '??' to provide a default when the optional value contains 'nil'}} {{49-49= ?? <#default value#>}}
+  // expected-note@-2 {{force-unwrap using '!' to abort execution if the optional value contains 'nil'}} {{49-49=!}}
+  let _: Int = try try try .optionalThrowsMember ?? 0
+
+  let _: Int = try! .optionalThrowsMember // expected-error {{value of optional type 'Int?' must be unwrapped to a value of type 'Int'}}
+  // expected-note@-1 {{coalesce using '??' to provide a default when the optional value contains 'nil'}} {{42-42= ?? <#default value#>}}
+  // expected-note@-2 {{force-unwrap using '!' to abort execution if the optional value contains 'nil'}} {{42-42=!}}
+  let _: Int = try! .optionalThrowsMember ?? 0
+}
+
+func rdar86611718(list: [Int]) {
+  String(list.count())
+  // expected-error@-1 {{cannot call value of non-function type 'Int'}}
 }

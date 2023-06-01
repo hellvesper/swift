@@ -432,13 +432,13 @@ bool DIMemoryObjectInfo::isElementLetProperty(unsigned Element) const {
   return false;
 }
 
-ConstructorDecl *DIMemoryObjectInfo::isActorInitSelf() const {
+ConstructorDecl *DIMemoryObjectInfo::getActorInitSelf() const {
   // is it 'self'?
   if (!MemoryInst->isVar())
     if (auto decl =
         dyn_cast_or_null<ClassDecl>(getASTType()->getAnyNominal()))
       // is it for an actor?
-      if (decl->isActor() && !decl->isDistributedActor()) // FIXME(78484431) skip distributed actors for now, until their initializers are fixed!
+      if (decl->isAnyActor())
         if (auto *silFn = MemoryInst->getFunction())
           // is it a designated initializer?
           if (auto *ctor = dyn_cast_or_null<ConstructorDecl>(
@@ -757,6 +757,23 @@ void ElementUseCollector::collectUses(SILValue Pointer, unsigned BaseEltNo) {
         Kind = DIUseKind::Initialization;
       else
         Kind = DIUseKind::InitOrAssign;
+
+      addElementUses(BaseEltNo, PointeeType, User, Kind);
+      continue;
+    }
+
+    if (auto *MAI = dyn_cast<MarkUnresolvedMoveAddrInst>(User)) {
+      // If this is the source of the copy_addr, then this is a load.  If it is
+      // the destination, then this is an unknown assignment.  Note that we'll
+      // revisit this instruction and add it to Uses twice if it is both a load
+      // and store to the same aggregate.
+      DIUseKind Kind;
+      if (Op->getOperandNumber() == 0)
+        Kind = DIUseKind::Load;
+      else if (InStructSubElement)
+        Kind = DIUseKind::PartialStore;
+      else
+        Kind = DIUseKind::Initialization;
 
       addElementUses(BaseEltNo, PointeeType, User, Kind);
       continue;
@@ -1187,7 +1204,9 @@ static bool isSuperInitUse(SILInstruction *User) {
   if (!LocExpr || !isa<OtherConstructorDeclRefExpr>(LocExpr->getFn()))
     return false;
 
-  if (LocExpr->getArg()->isSuperExpr())
+  auto *UnaryArg = LocExpr->getArgs()->getUnaryExpr();
+  assert(UnaryArg);
+  if (UnaryArg->isSuperExpr())
     return true;
 
   // Instead of super_ref_expr, we can also get this for inherited delegating
@@ -1195,7 +1214,7 @@ static bool isSuperInitUse(SILInstruction *User) {
 
   // (derived_to_base_expr implicit type='C'
   //   (declref_expr type='D' decl='self'))
-  if (auto *DTB = dyn_cast<DerivedToBaseExpr>(LocExpr->getArg())) {
+  if (auto *DTB = dyn_cast<DerivedToBaseExpr>(UnaryArg)) {
     if (auto *DRE = dyn_cast<DeclRefExpr>(DTB->getSubExpr())) {
         ASTContext &Ctx = DRE->getDecl()->getASTContext();
       if (DRE->getDecl()->isImplicit() &&
@@ -1482,6 +1501,13 @@ collectDelegatingInitUses(const DIMemoryObjectInfo &TheMemory,
       if (CAI->getDest() == I) {
         UseInfo.trackStoreToSelf(CAI);
         Kind = DIUseKind::InitOrAssign;
+      }
+    }
+
+    if (auto *MAI = dyn_cast<MarkUnresolvedMoveAddrInst>(User)) {
+      if (MAI->getDest() == I) {
+        UseInfo.trackStoreToSelf(MAI);
+        Kind = DIUseKind::Initialization;
       }
     }
 

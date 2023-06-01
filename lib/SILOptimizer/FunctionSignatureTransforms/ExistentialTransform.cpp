@@ -292,7 +292,7 @@ void ExistentialTransform::convertExistentialArgTypesToGenericArgTypes(
   /// Determine the existing generic parameter depth.
   int Depth = 0;
   if (OrigGenericSig != nullptr) {
-    Depth = OrigGenericSig->getGenericParams().back()->getDepth() + 1;
+    Depth = OrigGenericSig.getGenericParams().back()->getDepth() + 1;
   }
 
   /// Index of the Generic Parameter.
@@ -304,11 +304,17 @@ void ExistentialTransform::convertExistentialArgTypesToGenericArgTypes(
     auto &param = params[Idx];
     auto PType = param.getArgumentType(M, FTy, F->getTypeExpansionContext());
     assert(PType.isExistentialType());
+
+    CanType constraint = PType;
+    if (auto existential = PType->getAs<ExistentialType>())
+      constraint = existential->getConstraintType()->getCanonicalType();
+
     /// Generate new generic parameter.
-    auto *NewGenericParam = GenericTypeParamType::get(Depth, GPIdx++, Ctx);
+    auto *NewGenericParam =
+        GenericTypeParamType::get(/*type sequence*/ false, Depth, GPIdx++, Ctx);
     genericParams.push_back(NewGenericParam);
     Requirement NewRequirement(RequirementKind::Conformance, NewGenericParam,
-                               PType);
+                               constraint);
     requirements.push_back(NewRequirement);
     ArgToGenericTypeMap.insert(
         std::pair<int, GenericTypeParamType *>(Idx, NewGenericParam));
@@ -335,12 +341,9 @@ ExistentialTransform::createExistentialSpecializedFunctionType() {
   convertExistentialArgTypesToGenericArgTypes(GenericParams, Requirements);
 
   /// Compute the updated generic signature.
-  NewGenericSig = evaluateOrDefault(
-      Ctx.evaluator,
-      AbstractGenericSignatureRequest{
-        OrigGenericSig.getPointer(), std::move(GenericParams),
-        std::move(Requirements)},
-      GenericSignature());
+  NewGenericSig = buildGenericSignature(Ctx, OrigGenericSig,
+                                        std::move(GenericParams),
+                                        std::move(Requirements));
 
   /// Create a lambda for GenericParams.
   auto getCanonicalType = [&](Type t) -> CanType {
@@ -526,7 +529,7 @@ void ExistentialTransform::populateThunkBody() {
 
   unsigned int OrigDepth = 0;
   if (F->getLoweredFunctionType()->isPolymorphic()) {
-    OrigDepth = OrigCalleeGenericSig->getGenericParams().back()->getDepth() + 1;
+    OrigDepth = OrigCalleeGenericSig.getGenericParams().back()->getDepth() + 1;
   }
   SubstitutionMap OrigSubMap = F->getForwardingSubstitutionMap();
 
@@ -628,7 +631,7 @@ void ExistentialTransform::createExistentialSpecializedFunction() {
     NewF = CachedFn;
   } else {
     auto NewFGenericSig = NewFTy->getInvocationGenericSignature();
-    auto NewFGenericEnv = NewFGenericSig->getGenericEnvironment();
+    auto NewFGenericEnv = NewFGenericSig.getGenericEnvironment();
     SILLinkage linkage = getSpecializedLinkage(F, F->getLinkage());
 
     NewF = FunctionBuilder.createFunction(

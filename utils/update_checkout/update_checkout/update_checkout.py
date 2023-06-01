@@ -8,8 +8,6 @@
 # See https://swift.org/LICENSE.txt for license information
 # See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 
-from __future__ import print_function
-
 import argparse
 import json
 import os
@@ -72,7 +70,7 @@ def check_parallel_results(results, op):
             print("%s failed (ret=%d): %s" % (r.repo_path, r.ret, r))
             fail_count += 1
             if r.stderr:
-                print(r.stderr)
+                print(r.stderr.decode('utf-8'))
     return fail_count
 
 
@@ -260,7 +258,7 @@ def update_all_repositories(args, config, scheme_name, cross_repos_pr):
 
 def obtain_additional_swift_sources(pool_args):
     (args, repo_name, repo_info, repo_branch, remote, with_ssh, scheme_name,
-     skip_history, skip_repository_list) = pool_args
+     skip_history, skip_tags, skip_repository_list) = pool_args
 
     env = dict(os.environ)
     env.update({'GIT_TERMINAL_PROMPT': 0})
@@ -270,14 +268,14 @@ def obtain_additional_swift_sources(pool_args):
         print("Cloning '" + repo_name + "'")
 
         if skip_history:
-            shell.run(['git', 'clone',
-                       '--recursive', '--depth', '1', '--branch',
-                       repo_branch, remote, repo_name],
+            shell.run(['git', 'clone', '--recursive', '--depth', '1',
+                       '--branch', repo_branch, remote, repo_name] +
+                      (['--no-tags'] if skip_tags else []),
                       env=env,
                       echo=True)
         else:
-            shell.run(['git', 'clone',
-                       '--recursive', remote, repo_name],
+            shell.run(['git', 'clone', '--recursive', remote, repo_name] +
+                      (['--no-tags'] if skip_tags else []),
                       env=env,
                       echo=True)
         if scheme_name:
@@ -297,7 +295,8 @@ def obtain_additional_swift_sources(pool_args):
 
 
 def obtain_all_additional_swift_sources(args, config, with_ssh, scheme_name,
-                                        skip_history, skip_repository_list):
+                                        skip_history, skip_tags,
+                                        skip_repository_list):
 
     pool_args = []
     with shell.pushd(args.source_root, dry_run=False, echo=False):
@@ -342,7 +341,7 @@ def obtain_all_additional_swift_sources(args, config, with_ssh, scheme_name,
                 continue
 
             pool_args.append([args, repo_name, repo_info, repo_branch, remote,
-                              with_ssh, scheme_name, skip_history,
+                              with_ssh, scheme_name, skip_history, skip_tags,
                               skip_repository_list])
 
     if not pool_args:
@@ -471,6 +470,10 @@ repositories.
         help="Skip histories when obtaining sources",
         action="store_true")
     parser.add_argument(
+        "--skip-tags",
+        help="Skip tags when obtaining sources",
+        action="store_true")
+    parser.add_argument(
         "--skip-repository",
         metavar="DIRECTORY",
         default=[],
@@ -548,6 +551,7 @@ repositories.
     clone = args.clone
     clone_with_ssh = args.clone_with_ssh
     skip_history = args.skip_history
+    skip_tags = args.skip_tags
     scheme = args.scheme
     github_comment = args.github_comment
 
@@ -584,6 +588,7 @@ repositories.
                                                             clone_with_ssh,
                                                             scheme,
                                                             skip_history,
+                                                            skip_tags,
                                                             skip_repo_list)
 
     # Quick check whether somebody is calling update in an empty directory

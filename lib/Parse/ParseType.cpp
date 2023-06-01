@@ -37,7 +37,8 @@ TypeRepr *Parser::applyAttributeToType(TypeRepr *ty,
                                        const TypeAttributes &attrs,
                                        ParamDecl::Specifier specifier,
                                        SourceLoc specifierLoc,
-                                       SourceLoc isolatedLoc) {
+                                       SourceLoc isolatedLoc,
+                                       SourceLoc constLoc) {
   // Apply those attributes that do apply.
   if (!attrs.empty()) {
     ty = new (Context) AttributedTypeRepr(attrs, ty);
@@ -63,6 +64,10 @@ TypeRepr *Parser::applyAttributeToType(TypeRepr *ty,
   // Apply 'isolated'.
   if (isolatedLoc.isValid()) {
     ty = new (Context) IsolatedTypeRepr(ty, isolatedLoc);
+  }
+
+  if (constLoc.isValid()) {
+    ty = new (Context) CompileTimeConstTypeRepr(ty, constLoc);
   }
 
   return ty;
@@ -157,6 +162,7 @@ LayoutConstraint Parser::parseLayoutConstraint(Identifier LayoutConstraintID) {
 ///     type-simple '!'
 ///     type-collection
 ///     type-array
+///     '_'
 ParserResult<TypeRepr> Parser::parseTypeSimple(
     Diag<> MessageID, ParseTypeReason reason) {
   ParserResult<TypeRepr> ty;
@@ -189,6 +195,9 @@ ParserResult<TypeRepr> Parser::parseTypeSimple(
     ty = parseTypeCollection();
     break;
   }
+  case tok::kw__:
+    ty = makeParserResult(new (Context) PlaceholderTypeRepr(consumeToken()));
+    break;
   case tok::kw_protocol:
     if (startsWithLess(peekToken())) {
       ty = parseOldStyleProtocolComposition();
@@ -318,7 +327,8 @@ ParserResult<TypeRepr> Parser::parseSILBoxType(GenericParamList *generics,
                                      LAngleLoc, Args, RAngleLoc);
   return makeParserResult(applyAttributeToType(repr, attrs,
                                                ParamDecl::Specifier::Owned,
-                                               SourceLoc(), SourceLoc()));
+                                               SourceLoc(), SourceLoc(),
+                                               SourceLoc()));
 }
 
 
@@ -342,8 +352,10 @@ ParserResult<TypeRepr> Parser::parseType(
   ParamDecl::Specifier specifier;
   SourceLoc specifierLoc;
   SourceLoc isolatedLoc;
+  SourceLoc constLoc;
   TypeAttributes attrs;
-  status |= parseTypeAttributeList(specifier, specifierLoc, isolatedLoc, attrs);
+  status |= parseTypeAttributeList(specifier, specifierLoc, isolatedLoc, constLoc,
+                                   attrs);
 
   // Parse generic parameters in SIL mode.
   GenericParamList *generics = nullptr;
@@ -540,17 +552,19 @@ ParserResult<TypeRepr> Parser::parseType(
     if (tyR)
       tyR->walk(walker);
   }
-  if (specifierLoc.isValid() || isolatedLoc.isValid() || !attrs.empty())
+  if (specifierLoc.isValid() || isolatedLoc.isValid() || !attrs.empty() ||
+      constLoc.isValid())
     SyntaxContext->setCreateSyntax(SyntaxKind::AttributedType);
 
   return makeParserResult(
       status,
-      applyAttributeToType(tyR, attrs, specifier, specifierLoc, isolatedLoc));
+      applyAttributeToType(tyR, attrs, specifier, specifierLoc, isolatedLoc,
+                           constLoc));
 }
 
 ParserResult<TypeRepr> Parser::parseTypeWithOpaqueParams(Diag<> MessageID) {
   GenericParamList *genericParams = nullptr;
-  if (Context.LangOpts.EnableExperimentalOpaqueReturnTypes) {
+  if (Context.LangOpts.EnableExperimentalNamedOpaqueTypes) {
     auto result = maybeParseGenericParams();
     genericParams = result.getPtrOrNull();
     if (result.hasCodeCompletion())
@@ -790,10 +804,15 @@ Parser::parseTypeSimpleOrComposition(Diag<> MessageID, ParseTypeReason reason) {
   // This is only semantically allowed in certain contexts, but we parse it
   // generally for diagnostics and recovery.
   SourceLoc opaqueLoc;
+  SourceLoc anyLoc;
   if (Tok.isContextualKeyword("some")) {
     // Treat some as a keyword.
     TokReceiver->registerTokenKindChange(Tok.getLoc(), tok::contextual_keyword);
     opaqueLoc = consumeToken();
+  } else if (Tok.isContextualKeyword("any")) {
+    // Treat any as a keyword.
+    TokReceiver->registerTokenKindChange(Tok.getLoc(), tok::contextual_keyword);
+    anyLoc = consumeToken();
   } else {
     // This isn't a some type.
     SomeTypeContext.setTransparent();
@@ -802,6 +821,8 @@ Parser::parseTypeSimpleOrComposition(Diag<> MessageID, ParseTypeReason reason) {
   auto applyOpaque = [&](TypeRepr *type) -> TypeRepr* {
     if (opaqueLoc.isValid()) {
       type = new (Context) OpaqueReturnTypeRepr(opaqueLoc, type);
+    } else if (anyLoc.isValid()) {
+      type = new (Context) ExistentialTypeRepr(anyLoc, type);
     }
     return type;
   };
@@ -852,16 +873,21 @@ Parser::parseTypeSimpleOrComposition(Diag<> MessageID, ParseTypeReason reason) {
       consumeToken(); // consume '&'
     }
     
-    // Diagnose invalid `some` after an ampersand.
-    if (Tok.isContextualKeyword("some")) {
+    // Diagnose invalid `some` or `any` after an ampersand.
+    if (Tok.isContextualKeyword("some") ||
+        Tok.isContextualKeyword("any")) {
+      auto keyword = Tok.getText();
       auto badLoc = consumeToken();
 
-      diagnose(badLoc, diag::opaque_mid_composition)
+      diagnose(badLoc, diag::opaque_mid_composition, keyword)
           .fixItRemove(badLoc)
-          .fixItInsert(FirstTypeLoc, "some ");
+          .fixItInsert(FirstTypeLoc, keyword.str() + " ");
 
-      if (opaqueLoc.isInvalid())
+      if (opaqueLoc.isInvalid()) {
         opaqueLoc = badLoc;
+      } else if (anyLoc.isInvalid()) {
+        anyLoc = badLoc;
+      }
     }
 
     // Parse next type.
@@ -1013,10 +1039,6 @@ ParserResult<TypeRepr> Parser::parseTypeTupleBody() {
   TypeContext.setCreateSyntax(SyntaxKind::TupleType);
   Parser::StructureMarkerRAII ParsingTypeTuple(*this, Tok);
 
-  if (ParsingTypeTuple.isFailed()) {
-    return makeParserError();
-  }
-
   SourceLoc RPLoc, LPLoc = consumeToken(tok::l_paren);
   SourceLoc EllipsisLoc;
   unsigned EllipsisIdx;
@@ -1037,13 +1059,6 @@ ParserResult<TypeRepr> Parser::parseTypeTupleBody() {
     if (Tok.is(tok::kw_inout)) {
       Backtracking.emplace(*this);
       ObsoletedInOutLoc = consumeToken(tok::kw_inout);
-    }
-                                    
-    // If the label is "some", this could end up being an opaque type
-    // description if there's `some <identifier>` without a following colon,
-    // so we may need to backtrack as well.
-    if (Tok.isContextualKeyword("some")) {
-      Backtracking.emplace(*this);
     }
 
     // If the tuple element starts with a potential argument label followed by a
@@ -1438,8 +1453,11 @@ bool Parser::canParseType() {
   // Accept 'inout' at for better recovery.
   consumeIf(tok::kw_inout);
 
-  if (Tok.isContextualKeyword("some"))
+  if (Tok.isContextualKeyword("some")) {
     consumeToken();
+  } else if (Tok.isContextualKeyword("any")) {
+    consumeToken();
+  }
 
   switch (Tok.getKind()) {
   case tok::kw_Self:
@@ -1475,6 +1493,9 @@ bool Parser::canParseType() {
     }
     if (!consumeIf(tok::r_square))
       return false;
+    break;
+  case tok::kw__:
+    consumeToken();
     break;
 
 

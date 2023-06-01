@@ -26,8 +26,10 @@
 using namespace swift;
 using namespace reflection;
 
-TypeRefBuilder::BuiltType TypeRefBuilder::decodeMangledType(Node *node) {
-  return swift::Demangle::decodeMangledType(*this, node).getType();
+TypeRefBuilder::BuiltType
+TypeRefBuilder::decodeMangledType(Node *node, bool forRequirement) {
+  return swift::Demangle::decodeMangledType(*this, node, forRequirement)
+      .getType();
 }
 
 RemoteRef<char> TypeRefBuilder::readTypeRef(uint64_t remoteAddr) {
@@ -96,9 +98,12 @@ TypeRefBuilder::normalizeReflectionName(RemoteRef<char> reflectionName) {
       // Symbolic references cannot be mangled, return a failure.
       return {};
     default:
-      auto result = mangleNode(node);
+      auto mangling = mangleNode(node);
       clearNodeFactory();
-      return result;
+      if (!mangling.isSuccess()) {
+        return {};
+      }
+      return mangling.result();
     }
   }
 
@@ -198,9 +203,10 @@ TypeRefBuilder::getFieldTypeInfo(const TypeRef *TR) {
   if (Found != FieldTypeInfoCache.end())
     return Found->second;
 
-  // On failure, fill out the cache with everything we know about.
-  std::vector<std::pair<std::string, const TypeRef *>> Fields;
-  for (auto &Info : ReflectionInfos) {
+  // On failure, fill out the cache, ReflectionInfo by ReflectionInfo,
+  // until we find the field desciptor we're looking for.
+  while (FirstUnprocessedReflectionInfoIndex < ReflectionInfos.size()) {
+    auto &Info = ReflectionInfos[FirstUnprocessedReflectionInfoIndex];
     for (auto FD : Info.Field) {
       if (!FD->hasMangledTypeName())
         continue;
@@ -208,12 +214,14 @@ TypeRefBuilder::getFieldTypeInfo(const TypeRef *TR) {
       if (auto NormalizedName = normalizeReflectionName(CandidateMangledName))
         FieldTypeInfoCache[*NormalizedName] = FD;
     }
-  }
 
-  // We've filled the cache with everything we know about now. Try the cache again.
-  Found = FieldTypeInfoCache.find(MangledName);
-  if (Found != FieldTypeInfoCache.end())
-    return Found->second;
+    // Since we're done with the current ReflectionInfo, increment early in
+    // case we get a cache hit.
+    ++FirstUnprocessedReflectionInfoIndex;
+    Found = FieldTypeInfoCache.find(MangledName);
+    if (Found != FieldTypeInfoCache.end())
+      return Found->second;
+  }
 
   return nullptr;
 }

@@ -1239,11 +1239,11 @@ namespace {
       // # of entries
       uint32_t dataLength =
         sizeof(uint16_t) + sizeof(uint64_t) * data.size();
-      assert(dataLength == static_cast<uint16_t>(dataLength));
+      assert(dataLength == static_cast<uint32_t>(dataLength));
 
       endian::Writer writer(out, little);
       writer.write<uint16_t>(keyLength);
-      writer.write<uint16_t>(dataLength);
+      writer.write<uint32_t>(dataLength);
       return { keyLength, dataLength };
     }
 
@@ -1513,7 +1513,7 @@ namespace {
     static std::pair<unsigned, unsigned>
     ReadKeyDataLength(const uint8_t *&data) {
       unsigned keyLength = endian::readNext<uint16_t, little, unaligned>(data);
-      unsigned dataLength = endian::readNext<uint16_t, little, unaligned>(data);
+      unsigned dataLength = endian::readNext<uint32_t, little, unaligned>(data);
       return { keyLength, dataLength };
     }
 
@@ -1854,13 +1854,17 @@ SwiftNameLookupExtension::hashExtension(llvm::hash_code code) const {
   return llvm::hash_combine(code, StringRef("swift.lookup"),
                             SWIFT_LOOKUP_TABLE_VERSION_MAJOR,
                             SWIFT_LOOKUP_TABLE_VERSION_MINOR,
-                            swiftCtx.LangOpts.EnableExperimentalConcurrency,
                             version::getSwiftFullVersion());
 }
 
 void importer::addEntryToLookupTable(SwiftLookupTable &table,
                                      clang::NamedDecl *named,
                                      NameImporter &nameImporter) {
+  clang::PrettyStackTraceDecl trace(
+      named, named->getLocation(),
+      nameImporter.getClangContext().getSourceManager(),
+      "while adding SwiftName lookup table entries for clang declaration");
+
   // Determine whether this declaration is suppressed in Swift.
   if (shouldSuppressDeclImport(named))
     return;
@@ -2113,7 +2117,7 @@ void SwiftLookupTableWriter::populateTable(SwiftLookupTable &table,
 
   // Finalize the lookup table, which may fail.
   finalizeLookupTable(table, nameImporter, buffersForDiagnostics);
-};
+}
 
 std::unique_ptr<clang::ModuleFileExtensionWriter>
 SwiftNameLookupExtension::createExtensionWriter(clang::ASTWriter &writer) {

@@ -174,7 +174,12 @@ Alignment IRGenModule::getAsyncContextAlignment() const {
 void IRGenFunction::setupAsync(unsigned asyncContextIndex) {
   llvm::Value *c = CurFn->getArg(asyncContextIndex);
   asyncContextLocation = createAlloca(c->getType(), IGM.getPointerAlignment());
-  Builder.CreateStore(c, asyncContextLocation);
+
+  IRBuilder builder(IGM.getLLVMContext(), IGM.DebugInfo != nullptr);
+  // Insert the stores after the coro.begin.
+  builder.SetInsertPoint(getEarliestInsertionPoint()->getParent(),
+                         getEarliestInsertionPoint()->getIterator());
+  builder.CreateStore(c, asyncContextLocation);
 }
 
 llvm::Value *IRGenFunction::getAsyncTask() {
@@ -1087,16 +1092,19 @@ namespace {
         llvm_unreachable("OpenCL type in ABI lowering");
 
       // We should never see ARM SVE types at all.
-#define SVE_TYPE(Name, Id, ...) \
-      case clang::BuiltinType::Id:
+#define SVE_TYPE(Name, Id, ...) case clang::BuiltinType::Id:
 #include "clang/Basic/AArch64SVEACLETypes.def"
         llvm_unreachable("ARM SVE type in ABI lowering");
 
       // We should never see PPC MMA types at all.
-#define PPC_VECTOR_TYPE(Name, Id, Size) \
-      case clang::BuiltinType::Id:
+#define PPC_VECTOR_TYPE(Name, Id, Size) case clang::BuiltinType::Id:
 #include "clang/Basic/PPCTypes.def"
         llvm_unreachable("PPC MMA type in ABI lowering");
+
+      // We should never see RISC-V V types at all.
+#define RVV_TYPE(Name, Id, Size) case clang::BuiltinType::Id:
+#include "clang/Basic/RISCVVTypes.def"
+        llvm_unreachable("RISC-V V type in ABI lowering");
 
       // Handle all the integer types as opaque values.
 #define BUILTIN_TYPE(Id, SingletonId)
@@ -1978,6 +1986,46 @@ void IRGenFunction::emitAllExtractValues(llvm::Value *value,
     out.add(Builder.CreateExtractValue(value, i));
 }
 
+namespace {
+// TODO(compnerd) analyze if this should be out-lined via a runtime call rather
+// than be open-coded.  This needs to account for the fact that we are able to
+// statically optimize this often times due to CVP changing the select to a
+// `select i1 true, ...`.
+llvm::Value *emitIndirectAsyncFunctionPointer(IRGenFunction &IGF,
+                                              llvm::Value *pointer) {
+  llvm::IntegerType *IntPtrTy = IGF.IGM.IntPtrTy;
+  llvm::Type *AsyncFunctionPointerPtrTy = IGF.IGM.AsyncFunctionPointerPtrTy;
+  llvm::Constant *Zero =
+      llvm::Constant::getIntegerValue(IntPtrTy, APInt(IntPtrTy->getBitWidth(),
+                                                      0));
+  llvm::Constant *One =
+      llvm::Constant::getIntegerValue(IntPtrTy, APInt(IntPtrTy->getBitWidth(),
+                                                      1));
+  llvm::Constant *NegativeOne =
+      llvm::Constant::getIntegerValue(IntPtrTy, APInt(IntPtrTy->getBitWidth(),
+                                                      -2));
+  swift::irgen::Alignment PointerAlignment = IGF.IGM.getPointerAlignment();
+
+  llvm::Value *PtrToInt = IGF.Builder.CreatePtrToInt(pointer, IntPtrTy);
+  llvm::Value *And = IGF.Builder.CreateAnd(PtrToInt, One);
+  llvm::Value *ICmp = IGF.Builder.CreateICmpEQ(And, Zero);
+
+  llvm::Value *BitCast =
+      IGF.Builder.CreateBitCast(pointer, AsyncFunctionPointerPtrTy);
+
+  llvm::Value *UntaggedPointer = IGF.Builder.CreateAnd(PtrToInt, NegativeOne);
+  llvm::Value *IntToPtr =
+      IGF.Builder.CreateIntToPtr(UntaggedPointer,
+                                 AsyncFunctionPointerPtrTy->getPointerTo());
+  llvm::Value *Load = IGF.Builder.CreateLoad(IntToPtr, PointerAlignment);
+
+  // (select (icmp eq, (and (ptrtoint %AsyncFunctionPointer), 1), 0),
+  //         (%AsyncFunctionPointer),
+  //         (inttoptr (and (ptrtoint %AsyncFunctionPointer), -2)))
+  return IGF.Builder.CreateSelect(ICmp, BitCast, Load);
+}
+}
+
 std::pair<llvm::Value *, llvm::Value *> irgen::getAsyncFunctionAndSize(
     IRGenFunction &IGF, SILFunctionTypeRepresentation representation,
     FunctionPointer functionPointer, llvm::Value *thickContext,
@@ -1999,9 +2047,11 @@ std::pair<llvm::Value *, llvm::Value *> irgen::getAsyncFunctionAndSize(
       if (auto authInfo = functionPointer.getAuthInfo()) {
         ptr = emitPointerAuthAuth(IGF, ptr, authInfo);
       }
-      auto *afpPtr =
-          IGF.Builder.CreateBitCast(ptr, IGF.IGM.AsyncFunctionPointerPtrTy);
-      afpPtrValue = afpPtr;
+      afpPtrValue =
+          (IGF.IGM.getOptions().IndirectAsyncFunctionPointer)
+              ? emitIndirectAsyncFunctionPointer(IGF, ptr)
+              : IGF.Builder.CreateBitCast(ptr,
+                                          IGF.IGM.AsyncFunctionPointerPtrTy);
     }
     return *afpPtrValue;
   };
@@ -2012,7 +2062,9 @@ std::pair<llvm::Value *, llvm::Value *> irgen::getAsyncFunctionAndSize(
     } else if (auto *function = functionPointer.getRawAsyncFunction()) {
       fn = function;
     } else {
-      llvm::Value *addrPtr = IGF.Builder.CreateStructGEP(getAFPPtr(), 0);
+      llvm::Value *addrPtr = IGF.Builder.CreateStructGEP(
+          getAFPPtr()->getType()->getScalarType()->getPointerElementType(),
+          getAFPPtr(), 0);
       fn = IGF.emitLoadOfRelativePointer(
           Address(addrPtr, IGF.IGM.getPointerAlignment()), /*isFar*/ false,
           /*expectedType*/ functionPointer.getFunctionType()->getPointerTo());
@@ -2029,7 +2081,9 @@ std::pair<llvm::Value *, llvm::Value *> irgen::getAsyncFunctionAndSize(
                                     initialContextSize.getValue());
     } else {
       assert(!functionPointer.useStaticContextSize());
-      auto *sizePtr = IGF.Builder.CreateStructGEP(getAFPPtr(), 1);
+      auto *sizePtr = IGF.Builder.CreateStructGEP(
+          getAFPPtr()->getType()->getScalarType()->getPointerElementType(),
+          getAFPPtr(), 1);
       size = IGF.Builder.CreateLoad(sizePtr, IGF.IGM.getPointerAlignment());
     }
   }
@@ -3771,6 +3825,11 @@ emitRetconCoroutineEntry(IRGenFunction &IGF, CanSILFunctionType fnType,
   // Set the coroutine handle; this also flags that is a coroutine so that
   // e.g. dynamic allocas use the right code generation.
   IGF.setCoroutineHandle(hdl);
+
+  auto *pt = IGF.Builder.IRBuilderBase::CreateAlloca(IGF.IGM.Int1Ty,
+                                                     /*array size*/ nullptr,
+                                                     "earliest insert point");
+  IGF.setEarliestInsertionPoint(pt);
 }
 
 void irgen::emitAsyncFunctionEntry(IRGenFunction &IGF,
@@ -3796,6 +3855,11 @@ void irgen::emitAsyncFunctionEntry(IRGenFunction &IGF,
   // Set the coroutine handle; this also flags that is a coroutine so that
   // e.g. dynamic allocas use the right code generation.
   IGF.setCoroutineHandle(hdl);
+  auto *pt = IGF.Builder.IRBuilderBase::CreateAlloca(IGF.IGM.Int1Ty,
+                                                     /*array size*/ nullptr,
+                                                     "earliest insert point");
+  IGF.setEarliestInsertionPoint(pt);
+  IGF.setupAsync(asyncContextIndex);
 }
 
 void irgen::emitYieldOnceCoroutineEntry(
@@ -4054,6 +4118,11 @@ Address IRGenFunction::createErrorResultSlot(SILType errorType, bool isAsync) {
   auto addr = createAlloca(errorTI.getStorageType(),
                            errorTI.getFixedAlignment(), "swifterror");
 
+  if (!isAsync) {
+    builder.SetInsertPoint(getEarliestInsertionPoint()->getParent(),
+                           getEarliestInsertionPoint()->getIterator());
+  }
+
   // Only add the swifterror attribute on ABIs that pass it in a register.
   // We create a shadow stack location of the swifterror parameter for the
   // debugger on platforms that pass swifterror by reference and so we can't
@@ -4131,6 +4200,7 @@ void IRGenFunction::emitPrologue() {
   AllocaIP = Builder.IRBuilderBase::CreateAlloca(IGM.Int1Ty,
                                                  /*array size*/ nullptr,
                                                  "alloca point");
+  EarliestIP = AllocaIP;
 }
 
 /// Emit a branch to the return block and set the insert point there.
@@ -4170,6 +4240,8 @@ bool IRGenFunction::emitBranchToReturnBB() {
 
 /// Emit the epilogue for the function.
 void IRGenFunction::emitEpilogue() {
+  if (EarliestIP != AllocaIP)
+    EarliestIP->eraseFromParent();
   // Destroy the alloca insertion point.
   AllocaIP->eraseFromParent();
 }
@@ -4801,10 +4873,14 @@ llvm::Value *FunctionPointer::getPointer(IRGenFunction &IGF) const {
     auto *fnPtr = Value;
     if (auto authInfo = AuthInfo) {
       fnPtr = emitPointerAuthAuth(IGF, fnPtr, authInfo);
+      if (IGF.IGM.getOptions().IndirectAsyncFunctionPointer)
+        fnPtr = emitIndirectAsyncFunctionPointer(IGF, fnPtr);
     }
     auto *descriptorPtr =
         IGF.Builder.CreateBitCast(fnPtr, IGF.IGM.AsyncFunctionPointerPtrTy);
-    auto *addrPtr = IGF.Builder.CreateStructGEP(descriptorPtr, 0);
+    auto *addrPtr = IGF.Builder.CreateStructGEP(
+        descriptorPtr->getType()->getScalarType()->getPointerElementType(),
+        descriptorPtr, 0);
     auto *result = IGF.emitLoadOfRelativePointer(
         Address(addrPtr, IGF.IGM.getPointerAlignment()), /*isFar*/ false,
         /*expectedType*/ getFunctionType()->getPointerTo());
@@ -4906,7 +4982,15 @@ void irgen::emitAsyncReturn(
     arguments.push_back(arg);
 
   Builder.CreateIntrinsicCall(llvm::Intrinsic::coro_end_async, arguments);
-  Builder.CreateUnreachable();
+
+  if (IGF.IGM.AsyncTailCallKind == llvm::CallInst::TCK_MustTail) {
+    Builder.CreateUnreachable();
+  } else {
+    // If target doesn't support musttail (e.g. WebAssembly), the function
+    // passed to coro.end.async can return control back to the caller.
+    // So use ret void instead of unreachable to allow it.
+    Builder.CreateRetVoid();
+  }
 }
 
 void irgen::emitAsyncReturn(IRGenFunction &IGF, AsyncContextLayout &asyncLayout,

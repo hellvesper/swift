@@ -3,8 +3,236 @@ CHANGELOG
 
 _**Note:** This is in reverse chronological order, so newer entries are added to the top._
 
+Swift 5.6
+---------
+
+* Actor isolation checking now understands that `defer` bodies share the isolation of their enclosing function.
+
+  ```swift
+  // Works on global actors
+  @MainActor
+  func runAnimation(controller: MyViewController) async {
+    controller.hasActiveAnimation = true
+    defer { controller.hasActiveAnimation = false }
+
+    // do the animation here...
+  }
+
+  // Works on actor instances
+  actor OperationCounter {
+    var activeOperationCount = 0
+
+    func operate() async {
+      activeOperationCount += 1
+      defer { activeOperationCount -= 1 }
+
+      // do work here...
+    }
+  }
+  ```
+
+* [SE-0335][]:
+
+  Swift now allows existential types to be explicitly written with the `any`
+  keyword, creating a syntactic distinction between existential types and
+  protocol conformance constraints. For example:
+
+  ```swift
+  protocol P {}
+
+  func generic<T>(value: T) where T: P {
+    ...
+  }
+
+  func existential(value: any P) {
+     ...
+  }
+  ```
+
+* [SE-0337][]:
+
+  Swift now provides an incremental migration path to data race safety, allowing
+  APIs to adopt concurrency without breaking their clients that themselves have
+  not adopted concurrency. An existing declaration can introduce
+  concurrency-related annotations (such as making its closure parameters
+  `@Sendable`) and use the `@preconcurrency` attribute to maintain its behavior
+  for clients who have not themselves adopted concurrency:
+
+  ```swift
+  // module A
+  @preconcurrency func runOnSeparateTask(_ workItem: @Sendable () -> Void)
+
+  // module B
+  import A
+
+  class MyCounter {
+    var value = 0
+  }
+
+  func doesNotUseConcurrency(counter: MyCounter) {
+    runOnSeparateTask {
+      counter.value += 1 // no warning, because this code hasn't adopted concurrency
+    }
+  }
+
+  func usesConcurrency(counter: MyCounter) async {
+    runOnSeparateTask {
+      counter.value += 1 // warning: capture of non-Sendable type 'MyCounter'
+    }
+  }
+  ```
+
+  One can enable warnings about data race safety within a module with the
+  `-warn-concurrency` compiler option. When using a module that does not yet
+  provide `Sendable` annotations, one can suppress warnings for types from that
+  module by marking the import with `@preconcurrency`:
+
+  ```swift
+  /// module C
+  public struct Point {
+    public var x, y: Double
+  }
+
+  // module D
+  @preconcurrency import C
+
+  func centerView(at location: Point) {
+    Task {
+      await mainView.center(at: location) // no warning about non-Sendable 'Point' because the @preconcurrency import suppresses it
+    }
+  }
+  ```
+
+* [SE-0331][]:
+
+  The conformance of the unsafe pointer types (e.g., `UnsafePointer`,
+  `UnsafeMutableBufferPointer`) to the `Sendable` protocols has been removed,
+  because pointers cannot safely be transferred across task or actor boundaries.
+
+* References to `Self` or so-called "`Self` requirements" in the type signatures
+  of protocol members are now correctly detected in the parent of a nested type.
+  As a result, protocol members that fall under this overlooked case are no longer
+  available on values of protocol type:
+
+  ```swift
+  struct Outer<T> {
+    struct Inner {}
+  }
+
+  protocol P {}
+  extension P {
+    func method(arg: Outer<Self>.Inner) {}
+  }
+
+  func test(p: P) {
+    // error: 'method' has a 'Self' requirement and cannot be used on a value of
+    // protocol type (use a generic constraint instead).
+    _ = p.method
+  }
+  ```
+
+* [SE-0324][]:
+
+  Relax diagnostics for pointer arguments to C functions. The Swift
+  compiler now accepts limited pointer type mismatches when directly
+  calling functions imported from C as long as the C language allows
+  those pointer types to alias. Consequently, any Swift
+  `Unsafe[Mutable]Pointer<T>` or `Unsafe[Mutable]RawPointer` may be
+  passed to C function arguments declared as `[signed|unsigned] char
+  *`. Swift `Unsafe[Mutable]Pointer<T>` can also be passed to C
+  function arguments with an integer type that differs from `T` only
+  in its signedness.
+
+  For example, after importing a C function declaration:
+  ```c
+  long long decode_int64(const char *ptr_to_int64);
+  ```
+  Swift can now directly pass a raw pointer as the function argument:
+  ```swift
+  func decodeAsInt64(data: Data) -> Int64 {
+      data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+          decode_int64(bytes.baseAddress!)
+      }
+  }
+  ```
+
+* [SE-0322][]:
+
+  The standard library now provides a new operation
+  `withUnsafeTemporaryAllocation` which provides an efficient temporarily
+  allocation within a limited scope, which will be optimized to use stack
+  allocation when possible.
+
+* [SE-0315][]:
+
+  Type expressions and annotations can now include "type placeholders" which
+  directs the compiler to fill in that portion of the type according to the usual
+  type inference rules. Type placeholders are spelled as an underscore ("`_`") in
+  a type name. For instance:
+  
+  ```swift
+  // This is OK--the compiler can infer the key type as `Int`.
+  let dict: [_: String] = [0: "zero", 1: "one", 2: "two"]
+  ```
+
+* [SE-0290][]:
+
+  It is now possible to write inverted availability conditions by using the new `#unavailable` keyword:
+
+  ```swift
+  if #unavailable(iOS 15.0) {
+      // Old functionality
+  } else {
+      // iOS 15 functionality 
+  }
+  ```
+
+**Add new entries to the top of this section, not here!**
+
 Swift 5.5
 ---------
+
+### 2021-09-20 (Xcode 13.0)
+
+* [SE-0323][]:
+
+  The main function is executed with `MainActor` isolation applied, so functions
+  and variables with `MainActor` isolation may be called and modified
+  synchronously from the main function. If the main function is annotated with a
+  global actor explicitly, it must be the main actor or an error is emitted. If
+  no global actor annotation is present, the main function is implicitly run on
+  the main actor.
+
+  The main function is executed synchronously up to the first suspension point.
+  Any tasks enqueued by initializers in Objective-C or C++ will run after the
+  main function runs to the first suspension point. At the suspension point, the
+  main function suspends and the tasks are executed according to the Swift
+  concurrency mechanisms.
+
+* [SE-0313][]:
+
+  Parameters of actor type can be declared as `isolated`, which means that they
+  represent the actor on which that code will be executed. `isolated` parameters
+  extend the actor-isolated semantics of the `self` parameter of actor methods
+  to arbitrary parameters. For example:
+
+  ```swift
+  actor MyActor {
+    func f() { }
+  }
+
+  func g(actor: isolated MyActor) {
+    actor.f()   // okay, this code is always executing on "actor"
+  }
+
+  func h(actor: MyActor) async {
+    g(actor: actor)        // error, call must be asynchronous
+    await g(actor: actor)  // okay, hops to "actor" before calling g
+  }
+  ```
+
+  The `self` parameter of actor methods are implicitly `isolated`. The
+  `nonisolated` keyword makes the `self` parameter no longer `isolated`.
 
 * [SR-14731][]:
 
@@ -16,7 +244,8 @@ Swift 5.5
     // previously interpreted as a return type of Box<T>, ignoring the <Int> part;
     // now we diagnose an error with a fix-it suggesting replacing `Self` with `Box`
     static func makeBox() -> Self<Int> {...}
-  }```
+  }
+  ```
 
 * [SR-14878][]:
 
@@ -8627,17 +8856,26 @@ Swift 1.0
 [SE-0284]: <https://github.com/apple/swift-evolution/blob/main/proposals/0284-multiple-variadic-parameters.md>
 [SE-0286]: <https://github.com/apple/swift-evolution/blob/main/proposals/0286-forward-scan-trailing-closures.md>
 [SE-0287]: <https://github.com/apple/swift-evolution/blob/main/proposals/0287-implicit-member-chains.md>
+[SE-0290]: <https://github.com/apple/swift-evolution/blob/main/proposals/0290-negative-availability.md>
 [SE-0293]: <https://github.com/apple/swift-evolution/blob/main/proposals/0293-extend-property-wrappers-to-function-and-closure-parameters.md>
 [SE-0296]: <https://github.com/apple/swift-evolution/blob/main/proposals/0296-async-await.md>
 [SE-0297]: <https://github.com/apple/swift-evolution/blob/main/proposals/0297-concurrency-objc.md>
 [SE-0298]: <https://github.com/apple/swift-evolution/blob/main/proposals/0298-asyncsequence.md>
 [SE-0299]: <https://github.com/apple/swift-evolution/blob/main/proposals/0299-extend-generic-static-member-lookup.md>
 [SE-0300]: <https://github.com/apple/swift-evolution/blob/main/proposals/0300-continuation.md>
+[SE-0302]: <https://github.com/apple/swift-evolution/blob/main/proposals/0302-concurrent-value-and-concurrent-closures.md>
 [SE-0306]: <https://github.com/apple/swift-evolution/blob/main/proposals/0306-actors.md>
 [SE-0310]: <https://github.com/apple/swift-evolution/blob/main/proposals/0310-effectful-readonly-properties.md>
 [SE-0311]: <https://github.com/apple/swift-evolution/blob/main/proposals/0311-task-locals.md>
 [SE-0313]: <https://github.com/apple/swift-evolution/blob/main/proposals/0313-actor-isolation-control.md>
+[SE-0315]: <https://github.com/apple/swift-evolution/blob/main/proposals/0315-placeholder-types.md>
 [SE-0316]: <https://github.com/apple/swift-evolution/blob/main/proposals/0316-global-actors.md>
+[SE-0322]: <https://github.com/apple/swift-evolution/blob/main/proposals/0322-temporary-buffers.md>
+[SE-0324]: <https://github.com/apple/swift-evolution/blob/main/proposals/0324-c-lang-pointer-arg-conversion.md>
+[SE-0323]: <https://github.com/apple/swift-evolution/blob/main/proposals/0323-async-main-semantics.md>
+[SE-0331]: <https://github.com/apple/swift-evolution/blob/main/proposals/0331-remove-sendable-from-unsafepointer.md>
+[SE-0337]: <https://github.com/apple/swift-evolution/blob/main/proposals/0337-support-incremental-migration-to-concurrency-checking.md>
+[SE-0335]: <https://github.com/apple/swift-evolution/blob/main/proposals/0335-existential-any.md>
 
 [SR-75]: <https://bugs.swift.org/browse/SR-75>
 [SR-106]: <https://bugs.swift.org/browse/SR-106>

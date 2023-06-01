@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2020 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -42,7 +42,8 @@ using namespace swift;
 
 Witness::Witness(ValueDecl *decl, SubstitutionMap substitutions,
                  GenericEnvironment *syntheticEnv,
-                 SubstitutionMap reqToSynthesizedEnvSubs) {
+                 SubstitutionMap reqToSynthesizedEnvSubs,
+                 GenericSignature derivativeGenSig) {
   if (!syntheticEnv && substitutions.empty() &&
       reqToSynthesizedEnvSubs.empty()) {
     storage = decl;
@@ -53,7 +54,8 @@ Witness::Witness(ValueDecl *decl, SubstitutionMap substitutions,
   auto declRef = ConcreteDeclRef(decl, substitutions);
   auto storedMem = ctx.Allocate(sizeof(StoredWitness), alignof(StoredWitness));
   auto stored = new (storedMem) StoredWitness{declRef, syntheticEnv,
-                                              reqToSynthesizedEnvSubs};
+                                              reqToSynthesizedEnvSubs,
+                                              derivativeGenSig};
 
   storage = stored;
 }
@@ -186,13 +188,6 @@ ProtocolConformanceRef::getWitnessByName(Type type, DeclName name) const {
   return getConcrete()->getWitnessDeclRef(requirement);
 }
 
-void *ProtocolConformance::operator new(size_t bytes, ASTContext &context,
-                                        AllocationArena arena,
-                                        unsigned alignment) {
-  return context.Allocate(bytes, alignment, arena);
-
-}
-
 #define CONFORMANCE_SUBCLASS_DISPATCH(Method, Args)                          \
 switch (getKind()) {                                                         \
   case ProtocolConformanceKind::Normal:                                      \
@@ -203,6 +198,11 @@ switch (getKind()) {                                                         \
     return cast<SpecializedProtocolConformance>(this)->Method Args;          \
   case ProtocolConformanceKind::Inherited:                                   \
     return cast<InheritedProtocolConformance>(this)->Method Args;            \
+  case ProtocolConformanceKind::Builtin:                                     \
+    static_assert(&ProtocolConformance::Method !=                            \
+                    &BuiltinProtocolConformance::Method,                     \
+                  "Must override BuiltinProtocolConformance::" #Method);     \
+    return cast<BuiltinProtocolConformance>(this)->Method Args;              \
 }                                                                            \
 llvm_unreachable("bad ProtocolConformanceKind");
 
@@ -214,6 +214,7 @@ switch (getKind()) {                                                         \
     return cast<SelfProtocolConformance>(this)->Method Args;                 \
   case ProtocolConformanceKind::Specialized:                                 \
   case ProtocolConformanceKind::Inherited:                                   \
+  case ProtocolConformanceKind::Builtin:                                     \
     llvm_unreachable("not a root conformance");                              \
 }                                                                            \
 llvm_unreachable("bad ProtocolConformanceKind");
@@ -276,6 +277,8 @@ ValueDecl *ProtocolConformance::getWitnessDecl(ValueDecl *requirement) const {
   case ProtocolConformanceKind::Specialized:
     return cast<SpecializedProtocolConformance>(this)
       ->getGenericConformance()->getWitnessDecl(requirement);
+  case ProtocolConformanceKind::Builtin:
+    return requirement;
   }
   llvm_unreachable("unhandled kind");
 }
@@ -297,6 +300,7 @@ GenericEnvironment *ProtocolConformance::getGenericEnvironment() const {
     return getDeclContext()->getGenericEnvironmentOfContext();
 
   case ProtocolConformanceKind::Specialized:
+  case ProtocolConformanceKind::Builtin:
     // If we have a specialized protocol conformance, since we do not support
     // currently partial specialization, we know that it cannot have any open
     // type variables.
@@ -317,6 +321,9 @@ GenericSignature ProtocolConformance::getGenericSignature() const {
     // generic signature.
     return getDeclContext()->getGenericSignatureOfContext();
 
+  case ProtocolConformanceKind::Builtin:
+    return cast<BuiltinProtocolConformance>(this)->getGenericSignature();
+
   case ProtocolConformanceKind::Specialized:
     // If we have a specialized protocol conformance, since we do not support
     // currently partial specialization, we know that it cannot have any open
@@ -335,6 +342,7 @@ SubstitutionMap ProtocolConformance::getSubstitutions(ModuleDecl *M) const {
     switch (parent->getKind()) {
     case ProtocolConformanceKind::Normal:
     case ProtocolConformanceKind::Self:
+    case ProtocolConformanceKind::Builtin:
       llvm_unreachable("should have exited the loop?!");
     case ProtocolConformanceKind::Inherited:
       parent =
@@ -532,12 +540,12 @@ ConditionalRequirementsRequest::evaluate(Evaluator &evaluator,
   // something else. The most important bit is having the same type
   // parameters. (NB. if/when Swift gets parameterized extensions, this needs to
   // change.)
-  assert(typeSig->getCanonicalSignature().getGenericParams() ==
-         extensionSig->getCanonicalSignature().getGenericParams());
+  assert(typeSig.getCanonicalSignature().getGenericParams() ==
+         extensionSig.getCanonicalSignature().getGenericParams());
 
   // Find the requirements in the extension that aren't proved by the original
   // type, these are the ones that make the conformance conditional.
-  const auto unsatReqs = extensionSig->requirementsNotSatisfiedBy(typeSig);
+  const auto unsatReqs = extensionSig.requirementsNotSatisfiedBy(typeSig);
   if (unsatReqs.empty())
     return {};
 
@@ -886,7 +894,8 @@ NormalProtocolConformance::getWitnessUncached(ValueDecl *requirement) const {
 }
 
 Witness SelfProtocolConformance::getWitness(ValueDecl *requirement) const {
-  return Witness(requirement, SubstitutionMap(), nullptr, SubstitutionMap());
+  return Witness(requirement, SubstitutionMap(), nullptr, SubstitutionMap(),
+                 GenericSignature());
 }
 
 ConcreteDeclRef
@@ -950,9 +959,15 @@ void SpecializedProtocolConformance::computeConditionalRequirements() const {
     // Substitute the conditional requirements so that they're phrased in
     // terms of the specialized types, not the conformance-declaring decl's
     // types.
-    auto nominal = GenericConformance->getType()->getAnyNominal();
-    auto module = nominal->getModuleContext();
-    auto subMap = getType()->getContextSubstitutionMap(module, nominal);
+    ModuleDecl *module;
+    SubstitutionMap subMap;
+    if (auto nominal = GenericConformance->getType()->getAnyNominal()) {
+      module = nominal->getModuleContext();
+      subMap = getType()->getContextSubstitutionMap(module, nominal);
+    } else {
+      module = getProtocol()->getModuleContext();
+      subMap = getSubstitutionMap();
+    }
 
     SmallVector<Requirement, 4> newReqs;
     for (auto oldReq : *parentCondReqs) {
@@ -1101,6 +1116,7 @@ ProtocolConformance::getRootConformance() const {
     switch (C->getKind()) {
     case ProtocolConformanceKind::Normal:
     case ProtocolConformanceKind::Self:
+    case ProtocolConformanceKind::Builtin:
       return cast<RootProtocolConformance>(C);
     case ProtocolConformanceKind::Inherited:
       C = cast<InheritedProtocolConformance>(C)
@@ -1148,6 +1164,32 @@ ProtocolConformance::subst(TypeSubstitutionFn subs,
         .getSpecializedConformance(substType,
                                    const_cast<ProtocolConformance *>(this),
                                    subMap);
+  }
+  case ProtocolConformanceKind::Builtin: {
+    auto origType = getType();
+    if (!origType->hasTypeParameter() &&
+        !origType->hasArchetype())
+      return const_cast<ProtocolConformance *>(this);
+
+    auto substType = origType.subst(subs, conformances, options);
+
+    // We do an exact pointer equality check because subst() can
+    // change sugar.
+    if (substType.getPointer() == origType.getPointer())
+      return const_cast<ProtocolConformance *>(this);
+
+    SmallVector<Requirement, 2> requirements;
+    for (auto req : getConditionalRequirements()) {
+      requirements.push_back(*req.subst(subs, conformances, options));
+    }
+
+    auto kind = cast<BuiltinProtocolConformance>(this)
+        ->getBuiltinConformanceKind();
+
+    return substType->getASTContext()
+        .getBuiltinConformance(substType,
+                               getProtocol(), getGenericSignature(),
+                               requirements, kind);
   }
   case ProtocolConformanceKind::Self:
     return const_cast<ProtocolConformance*>(this);
@@ -1263,11 +1305,10 @@ void NominalTypeDecl::prepareConformanceTable() const {
 }
 
 bool NominalTypeDecl::lookupConformance(
-       ModuleDecl *module, ProtocolDecl *protocol,
+       ProtocolDecl *protocol,
        SmallVectorImpl<ProtocolConformance *> &conformances) const {
   prepareConformanceTable();
   return ConformanceTable->lookupConformance(
-           module,
            const_cast<NominalTypeDecl *>(this),
            protocol,
            conformances);
@@ -1299,9 +1340,9 @@ void NominalTypeDecl::getImplicitProtocols(
 }
 
 void NominalTypeDecl::registerProtocolConformance(
-       ProtocolConformance *conformance) {
+       ProtocolConformance *conformance, bool synthesized) {
   prepareConformanceTable();
-  ConformanceTable->registerProtocolConformance(conformance);
+  ConformanceTable->registerProtocolConformance(conformance, synthesized);
 }
 
 ArrayRef<ValueDecl *>
@@ -1494,7 +1535,8 @@ bool ProtocolConformance::isCanonical() const {
 
   switch (getKind()) {
   case ProtocolConformanceKind::Self:
-  case ProtocolConformanceKind::Normal: {
+  case ProtocolConformanceKind::Normal:
+  case ProtocolConformanceKind::Builtin: {
     return true;
   }
   case ProtocolConformanceKind::Inherited: {
@@ -1523,7 +1565,8 @@ ProtocolConformance *ProtocolConformance::getCanonicalConformance() {
 
   switch (getKind()) {
   case ProtocolConformanceKind::Self:
-  case ProtocolConformanceKind::Normal: {
+  case ProtocolConformanceKind::Normal:
+  case ProtocolConformanceKind::Builtin: {
     // Root conformances are always canonical by construction.
     return this;
   }
@@ -1563,6 +1606,21 @@ ProtocolConformanceRef::getCanonicalConformanceRef() const {
   if (isAbstract() || isInvalid())
     return *this;
   return ProtocolConformanceRef(getConcrete()->getCanonicalConformance());
+}
+
+BuiltinProtocolConformance::BuiltinProtocolConformance(
+    Type conformingType, ProtocolDecl *protocol,
+    GenericSignature genericSig,
+    ArrayRef<Requirement> conditionalRequirements,
+    BuiltinConformanceKind kind
+) : RootProtocolConformance(ProtocolConformanceKind::Builtin, conformingType),
+    protocol(protocol), genericSig(genericSig),
+    numConditionalRequirements(conditionalRequirements.size()),
+    builtinConformanceKind(static_cast<unsigned>(kind))
+{
+  std::uninitialized_copy(conditionalRequirements.begin(),
+                          conditionalRequirements.end(),
+                          getTrailingObjects<Requirement>());
 }
 
 // See swift/Basic/Statistic.h for declaration: this enables tracing
@@ -1625,4 +1683,35 @@ SourceLoc swift::extractNearestSourceLoc(const ProtocolConformanceRef conformanc
     return extractNearestSourceLoc(conformanceRef.getConcrete());
   }
   return SourceLoc();
+}
+
+bool ProtocolConformanceRef::hasMissingConformance(ModuleDecl *module) const {
+  return forEachMissingConformance(module,
+      [](BuiltinProtocolConformance *builtin) {
+        return true;
+      });
+}
+
+bool ProtocolConformanceRef::forEachMissingConformance(
+    ModuleDecl *module,
+    llvm::function_ref<bool(BuiltinProtocolConformance *missing)> fn) const {
+  if (!isConcrete())
+    return false;
+
+  // Is this a missing conformance?
+  ProtocolConformance *concreteConf = getConcrete();
+  RootProtocolConformance *rootConf = concreteConf->getRootConformance();
+  if (auto builtinConformance = dyn_cast<BuiltinProtocolConformance>(rootConf)){
+    if (builtinConformance->isMissing() && fn(builtinConformance))
+      return true;
+  }
+
+  // Check conformances that are part of this conformance.
+  auto subMap = concreteConf->getSubstitutions(module);
+  for (auto conformance : subMap.getConformances()) {
+    if (conformance.forEachMissingConformance(module, fn))
+      return true;
+  }
+
+  return false;
 }

@@ -17,7 +17,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "GenericSignatureBuilderImpl.h"
-#include "swift/AST/GenericSignatureBuilder.h"
+#include "GenericSignatureBuilder.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/DiagnosticEngine.h"
@@ -54,8 +54,12 @@
 using namespace swift;
 using llvm::DenseMap;
 
-/// Define this to 1 to enable expensive assertions.
-#define SWIFT_GSB_EXPENSIVE_ASSERTIONS 0
+#define DEBUG_TYPE "Serialization"
+
+STATISTIC(NumLazyRequirementSignaturesLoaded,
+          "# of lazily-deserialized requirement signatures loaded");
+
+#undef DEBUG_TYPE
 
 namespace {
   typedef GenericSignatureBuilder::RequirementSource RequirementSource;
@@ -1912,10 +1916,12 @@ bool EquivalenceClass::recordConformanceConstraint(
 
     // If there is a concrete type that resolves this conformance requirement,
     // record the conformance.
-    if (!builder.resolveConcreteConformance(type, proto)) {
+    bool explicitConformance = !source->isDerivedRequirement();
+
+    if (!builder.resolveConcreteConformance(type, proto, explicitConformance)) {
       // Otherwise, determine whether there is a superclass constraint where the
       // superclass conforms to this protocol.
-      (void)builder.resolveSuperConformance(type, proto);
+      (void)builder.resolveSuperConformance(type, proto, explicitConformance);
     }
   }
 
@@ -1979,35 +1985,6 @@ bool EquivalenceClass::isConformanceSatisfiedBySuperclass(
   return false;
 }
 
-/// Compare two associated types.
-static int compareAssociatedTypes(AssociatedTypeDecl *assocType1,
-                                  AssociatedTypeDecl *assocType2) {
-  // - by name.
-  if (int result = assocType1->getName().str().compare(
-                                              assocType2->getName().str()))
-    return result;
-
-  // Prefer an associated type with no overrides (i.e., an anchor) to one
-  // that has overrides.
-  bool hasOverridden1 = !assocType1->getOverriddenDecls().empty();
-  bool hasOverridden2 = !assocType2->getOverriddenDecls().empty();
-  if (hasOverridden1 != hasOverridden2)
-    return hasOverridden1 ? +1 : -1;
-
-  // - by protocol, so t_n_m.`P.T` < t_n_m.`Q.T` (given P < Q)
-  auto proto1 = assocType1->getProtocol();
-  auto proto2 = assocType2->getProtocol();
-  if (int compareProtocols = TypeDecl::compare(proto1, proto2))
-    return compareProtocols;
-
-  // Error case: if we have two associated types with the same name in the
-  // same protocol, just tie-break based on address.
-  if (assocType1 != assocType2)
-    return assocType1 < assocType2 ? -1 : +1;
-
-  return 0;
-}
-
 static void lookupConcreteNestedType(NominalTypeDecl *decl,
                                      Identifier name,
                                      SmallVectorImpl<TypeDecl *> &concreteDecls) {
@@ -2020,36 +1997,16 @@ static void lookupConcreteNestedType(NominalTypeDecl *decl,
     concreteDecls.push_back(cast<TypeDecl>(member));
 }
 
-static auto findBestConcreteNestedType(SmallVectorImpl<TypeDecl *> &concreteDecls) {
-  return std::min_element(concreteDecls.begin(), concreteDecls.end(),
-                          [](TypeDecl *type1, TypeDecl *type2) {
-                            return TypeDecl::compare(type1, type2) < 0;
-                          });
+static TypeDecl *findBestConcreteNestedType(SmallVectorImpl<TypeDecl *> &concreteDecls) {
+  return *std::min_element(concreteDecls.begin(), concreteDecls.end(),
+                           [](TypeDecl *type1, TypeDecl *type2) {
+                             return TypeDecl::compare(type1, type2) < 0;
+                           });
 }
 
 TypeDecl *EquivalenceClass::lookupNestedType(
                              GenericSignatureBuilder &builder,
-                             Identifier name,
-                             SmallVectorImpl<TypeDecl *> *otherConcreteTypes) {
-  // Populates the result structures from the given cache entry.
-  auto populateResult = [&](const CachedNestedType &cache) -> TypeDecl * {
-    if (otherConcreteTypes)
-      otherConcreteTypes->clear();
-
-    // If there aren't any types in the cache, we're done.
-    if (cache.types.empty()) return nullptr;
-
-    // The first type in the cache is always the final result.
-    // Collect the rest in the concrete-declarations list, if needed.
-    if (otherConcreteTypes) {
-      for (auto type : ArrayRef<TypeDecl *>(cache.types).slice(1)) {
-        otherConcreteTypes->push_back(type);
-      }
-    }
-
-    return cache.types.front();
-  };
-
+                             Identifier name) {
   // If we have a cached value that is up-to-date, use that.
   auto cached = nestedTypeNameCache.find(name);
   if (cached != nestedTypeNameCache.end() &&
@@ -2059,7 +2016,7 @@ TypeDecl *EquivalenceClass::lookupNestedType(
       (!concreteType ||
         cached->second.concreteTypePresent == concreteType->getCanonicalType())) {
     ++NumNestedTypeCacheHits;
-    return populateResult(cached->second);
+    return cached->second.type;
   }
 
   // Cache miss; go compute the result.
@@ -2112,24 +2069,16 @@ TypeDecl *EquivalenceClass::lookupNestedType(
   entry.concreteTypePresent =
     concreteType ? concreteType->getCanonicalType() : CanType();
   if (bestAssocType) {
-    entry.types.push_back(bestAssocType);
-    entry.types.insert(entry.types.end(),
-                       concreteDecls.begin(), concreteDecls.end());
+    entry.type = bestAssocType;
     assert(bestAssocType->getOverriddenDecls().empty() &&
            "Lookup should never keep a non-anchor associated type");
   } else if (!concreteDecls.empty()) {
     // Find the best concrete type.
-    auto bestConcreteTypeIter = findBestConcreteNestedType(concreteDecls);
-
-    // Put the best concrete type first; the rest will follow.
-    entry.types.push_back(*bestConcreteTypeIter);
-    entry.types.insert(entry.types.end(),
-                       concreteDecls.begin(), bestConcreteTypeIter);
-    entry.types.insert(entry.types.end(),
-                       bestConcreteTypeIter + 1, concreteDecls.end());
+    entry.type = findBestConcreteNestedType(concreteDecls);
   }
 
-  return populateResult((nestedTypeNameCache[name] = std::move(entry)));
+  nestedTypeNameCache[name] = entry;
+  return entry.type;
 }
 
 static Type getSugaredDependentType(Type type,
@@ -2195,127 +2144,6 @@ Type EquivalenceClass::getAnchor(
 #endif
 
   return substAnchor();
-}
-
-Type EquivalenceClass::getTypeInContext(GenericSignatureBuilder &builder,
-                                        GenericEnvironment *genericEnv) {
-  auto genericParams = genericEnv->getGenericParams();
-
-  // The anchor descr
-  Type anchor = getAnchor(builder, genericParams);
-
-  // If this equivalence class is mapped to a concrete type, produce that
-  // type.
-  if (concreteType) {
-    if (recursiveConcreteType)
-      return ErrorType::get(anchor);
-
-    // Prevent recursive substitution.
-    this->recursiveConcreteType = true;
-    SWIFT_DEFER {
-      this->recursiveConcreteType = false;
-    };
-
-    return genericEnv->mapTypeIntoContext(concreteType,
-                                          builder.getLookupConformanceFn());
-  }
-
-  // Local function to check whether we have a generic parameter that has
-  // already been recorded
-  auto getAlreadyRecoveredGenericParam = [&]() -> Type {
-    auto genericParam = anchor->getAs<GenericTypeParamType>();
-    if (!genericParam) return Type();
-
-    auto type = genericEnv->getMappingIfPresent(genericParam);
-    if (!type) return Type();
-
-    // We already have a mapping for this generic parameter in the generic
-    // environment. Return it.
-    return *type;
-  };
-
-  AssociatedTypeDecl *assocType = nullptr;
-  ArchetypeType *parentArchetype = nullptr;
-  if (auto depMemTy = anchor->getAs<DependentMemberType>()) {
-    // Resolve the equivalence class of the parent.
-    auto parentEquivClass =
-      builder.resolveEquivalenceClass(
-                          depMemTy->getBase(),
-                          ArchetypeResolutionKind::CompleteWellFormed);
-    if (!parentEquivClass)
-      return ErrorType::get(anchor);
-
-    // Map the parent type into this context.
-    parentArchetype =
-      parentEquivClass->getTypeInContext(builder, genericEnv)
-                      ->castTo<ArchetypeType>();
-
-    // If we already have a nested type with this name, return it.
-    assocType = depMemTy->getAssocType();
-    if (auto nested =
-          parentArchetype->getNestedTypeIfKnown(assocType->getName())) {
-      return *nested;
-    }
-
-    // We will build the archetype below.
-  } else if (auto result = getAlreadyRecoveredGenericParam()) {
-    // Return already-contextualized generic type parameter.
-    return result;
-  }
-
-  // Substitute into the superclass.
-  Type superclass = this->recursiveSuperclassType ? Type() : this->superclass;
-  if (superclass && superclass->hasTypeParameter()) {
-    // Prevent recursive substitution.
-    this->recursiveSuperclassType = true;
-    SWIFT_DEFER {
-      this->recursiveSuperclassType = false;
-    };
-
-    superclass = genericEnv->mapTypeIntoContext(
-                                            superclass,
-                                            builder.getLookupConformanceFn());
-    if (superclass->is<ErrorType>())
-      superclass = Type();
-
-    // We might have recursively recorded the archetype; if so, return early.
-    // FIXME: This should be detectable before we end up building archetypes.
-    if (auto result = getAlreadyRecoveredGenericParam())
-      return result;
-  }
-
-  // Build a new archetype.
-
-  // Collect the protocol conformances for the archetype.
-  SmallVector<ProtocolDecl *, 4> protos;
-  for (const auto &conforms : conformsTo) {
-    auto proto = conforms.first;
-
-    if (!isConformanceSatisfiedBySuperclass(proto))
-      protos.push_back(proto);
-  }
-
-  ArchetypeType *archetype;
-  ASTContext &ctx = builder.getASTContext();
-  if (parentArchetype) {
-    // Create a nested archetype.
-    auto *depMemTy = anchor->castTo<DependentMemberType>();
-    archetype = NestedArchetypeType::getNew(ctx, parentArchetype, depMemTy,
-                                            protos, superclass, layout);
-
-    // Register this archetype with its parent.
-    parentArchetype->registerNestedType(assocType->getName(), archetype);
-  } else {
-    // Create a top-level archetype.
-    auto genericParam = anchor->castTo<GenericTypeParamType>();
-    archetype = PrimaryArchetypeType::getNew(ctx, genericEnv, genericParam,
-                                             protos, superclass, layout);
-
-    // Register the archetype with the generic environment.
-    genericEnv->addMapping(genericParam, archetype);
-  }
-
-  return archetype;
 }
 
 void EquivalenceClass::dump(llvm::raw_ostream &out,
@@ -2498,7 +2326,8 @@ void GenericSignatureBuilder::addConditionalRequirements(
 
 const RequirementSource *
 GenericSignatureBuilder::resolveConcreteConformance(ResolvedType type,
-                                                    ProtocolDecl *proto) {
+                                                    ProtocolDecl *proto,
+                                                    bool explicitConformance) {
   auto equivClass = type.getEquivalenceClass(*this);
   auto concrete = equivClass->concreteType;
   if (!concrete) return nullptr;
@@ -2552,22 +2381,22 @@ GenericSignatureBuilder::resolveConcreteConformance(ResolvedType type,
   equivClass->recordConformanceConstraint(*this, type, proto, concreteSource);
 
   // Only infer conditional requirements from explicit sources.
-  bool hasExplicitSource = llvm::any_of(
+  bool explicitConcreteType = llvm::any_of(
       equivClass->concreteTypeConstraints,
       [](const ConcreteConstraint &constraint) {
-        return (!constraint.source->isDerivedRequirement() &&
-                constraint.source->getLoc().isValid());
+        return !constraint.source->isDerivedRequirement();
       });
 
-  if (hasExplicitSource) {
+  if (explicitConformance || explicitConcreteType) {
     addConditionalRequirements(conformance, /*inferForModule=*/nullptr);
   }
 
   return concreteSource;
 }
-const RequirementSource *GenericSignatureBuilder::resolveSuperConformance(
-                                                        ResolvedType type,
-                                                        ProtocolDecl *proto) {
+const RequirementSource *
+GenericSignatureBuilder::resolveSuperConformance(ResolvedType type,
+                                                 ProtocolDecl *proto,
+                                                 bool explicitConformance) {
   // Get the superclass constraint.
   auto equivClass = type.getEquivalenceClass(*this);
   Type superclass = equivClass->superclass;
@@ -2593,14 +2422,13 @@ const RequirementSource *GenericSignatureBuilder::resolveSuperConformance(
   equivClass->recordConformanceConstraint(*this, type, proto, superclassSource);
 
   // Only infer conditional requirements from explicit sources.
-  bool hasExplicitSource = llvm::any_of(
-    equivClass->superclassConstraints,
-    [](const ConcreteConstraint &constraint) {
-      return (!constraint.source->isDerivedRequirement() &&
-              constraint.source->getLoc().isValid());
-    });
+  bool explicitSuperclass = llvm::any_of(
+      equivClass->superclassConstraints,
+      [](const ConcreteConstraint &constraint) {
+        return !constraint.source->isDerivedRequirement();
+      });
 
-  if (hasExplicitSource) {
+  if (explicitConformance || explicitSuperclass) {
     addConditionalRequirements(conformance, /*inferForModule=*/nullptr);
   }
 
@@ -2658,44 +2486,6 @@ auto PotentialArchetype::getRepresentative() const -> PotentialArchetype * {
   }
 
   return result;
-}
-
-/// Canonical ordering for dependent types.
-int swift::compareDependentTypes(Type type1, Type type2) {
-  // Fast-path check for equality.
-  if (type1->isEqual(type2)) return 0;
-
-  // Ordering is as follows:
-  // - Generic params
-  auto gp1 = type1->getAs<GenericTypeParamType>();
-  auto gp2 = type2->getAs<GenericTypeParamType>();
-  if (gp1 && gp2)
-    return GenericParamKey(gp1) < GenericParamKey(gp2) ? -1 : +1;
-
-  // A generic parameter is always ordered before a nested type.
-  if (static_cast<bool>(gp1) != static_cast<bool>(gp2))
-    return gp1 ? -1 : +1;
-
-  // - Dependent members
-  auto depMemTy1 = type1->castTo<DependentMemberType>();
-  auto depMemTy2 = type2->castTo<DependentMemberType>();
-
-  // - by base, so t_0_n.`P.T` < t_1_m.`P.T`
-  if (int compareBases =
-        compareDependentTypes(depMemTy1->getBase(), depMemTy2->getBase()))
-    return compareBases;
-
-  // - by name, so t_n_m.`P.T` < t_n_m.`P.U`
-  if (int compareNames = depMemTy1->getName().str().compare(
-                                                  depMemTy2->getName().str()))
-    return compareNames;
-
-  auto *assocType1 = depMemTy1->getAssocType();
-  auto *assocType2 = depMemTy2->getAssocType();
-  if (int result = compareAssociatedTypes(assocType1, assocType2))
-    return result;
-
-  return 0;
 }
 
 /// Compare two dependent paths to determine which is better.
@@ -2852,38 +2642,6 @@ PotentialArchetype *PotentialArchetype::getOrCreateNestedType(
   }
 
   return resultPA;
-}
-
-void ArchetypeType::resolveNestedType(
-                                    std::pair<Identifier, Type> &nested) const {
-  auto genericEnv = getGenericEnvironment();
-  auto &builder = *genericEnv->getGenericSignatureBuilder();
-
-  Type interfaceType = getInterfaceType();
-  Type memberInterfaceType =
-    DependentMemberType::get(interfaceType, nested.first);
-  auto resolved =
-    builder.maybeResolveEquivalenceClass(
-                                  memberInterfaceType,
-                                  ArchetypeResolutionKind::CompleteWellFormed,
-                                  /*wantExactPotentialArchetype=*/false);
-  if (!resolved) {
-    nested.second = ErrorType::get(interfaceType);
-    return;
-  }
-
-  Type result;
-  if (auto concrete = resolved.getAsConcreteType()) {
-    result = concrete;
-  } else {
-    auto *equivClass = resolved.getEquivalenceClass(builder);
-    result = equivClass->getTypeInContext(builder, genericEnv);
-  }
-
-  assert(!nested.second ||
-         nested.second->isEqual(result) ||
-         (nested.second->hasError() && result->hasError()));
-  nested.second = result;
 }
 
 Type GenericSignatureBuilder::PotentialArchetype::getDependentType(
@@ -3061,9 +2819,9 @@ static Type formDependentType(GenericTypeParamType *base,
 /// parameter key, then following the path of associated types.
 static Type formDependentType(ASTContext &ctx, GenericParamKey genericParam,
                               RelativeRewritePath path) {
-  return formDependentType(GenericTypeParamType::get(genericParam.Depth,
-                                                     genericParam.Index,
-                                                     ctx),
+  return formDependentType(GenericTypeParamType::get(genericParam.TypeSequence,
+                                                     genericParam.Depth,
+                                                     genericParam.Index, ctx),
                            path);
 }
 
@@ -3551,9 +3309,9 @@ bool GenericSignatureBuilder::addSameTypeRewriteRule(CanType type1,
   }
 
   // Add the rewrite rule.
-  Type firstBase =
-    GenericTypeParamType::get(path1.getBase()->Depth, path1.getBase()->Index,
-                              getASTContext());
+  Type firstBase = GenericTypeParamType::get(
+      path1.getBase()->TypeSequence, path1.getBase()->Depth,
+      path1.getBase()->Index, getASTContext());
   CanType baseAnchor =
     getCanonicalTypeParameter(firstBase)->getCanonicalType();
   auto root = Impl->getOrCreateRewriteTreeRoot(baseAnchor);
@@ -3562,10 +3320,9 @@ bool GenericSignatureBuilder::addSameTypeRewriteRule(CanType type1,
 
 Type GenericSignatureBuilder::getCanonicalTypeParameter(Type type) {
   auto initialPath = RewritePath::createPath(type);
-  auto genericParamType =
-    GenericTypeParamType::get(initialPath.getBase()->Depth,
-                              initialPath.getBase()->Index,
-                              getASTContext());
+  auto genericParamType = GenericTypeParamType::get(
+      initialPath.getBase()->TypeSequence, initialPath.getBase()->Depth,
+      initialPath.getBase()->Index, getASTContext());
 
   unsigned startIndex = 0;
   Type currentType = genericParamType;
@@ -3602,8 +3359,8 @@ Type GenericSignatureBuilder::getCanonicalTypeParameter(Type type) {
         // If this is an absolute path, use the new base.
         if (auto newBase = match->second.getBase()) {
           genericParamType =
-            GenericTypeParamType::get(newBase->Depth, newBase->Index,
-                                      getASTContext());
+              GenericTypeParamType::get(newBase->TypeSequence, newBase->Depth,
+                                        newBase->Index, getASTContext());
         }
 
         // Move back to the beginning; we may have opened up other rewrites.
@@ -3829,8 +3586,7 @@ ResolvedType GenericSignatureBuilder::maybeResolveEquivalenceClass(
           if (concreteDecls.empty())
             return ResolvedType::forUnresolved(nullptr);
 
-          auto bestConcreteTypeIter = findBestConcreteNestedType(concreteDecls);
-          concreteDecl = *bestConcreteTypeIter;
+          concreteDecl = findBestConcreteNestedType(concreteDecls);
         }
       }
 
@@ -4048,7 +3804,7 @@ GenericSignatureBuilder::getConformanceAccessPath(Type type,
   // visit all of the root conformance requirements in our generic signature and
   // add them to the buffer.
   if (Impl->ConformanceAccessPaths.empty()) {
-    for (const auto &req : sig->getRequirements()) {
+    for (const auto &req : sig.getRequirements()) {
       // We only care about conformance requirements.
       if (req.getKind() != RequirementKind::Conformance)
         continue;
@@ -4155,11 +3911,18 @@ bool GenericSignatureBuilder::addGenericParameterRequirements(
 void GenericSignatureBuilder::addGenericParameter(GenericTypeParamType *GenericParam) {
   auto params = getGenericParams();
   (void)params;
-  assert(params.empty() ||
-         ((GenericParam->getDepth() == params.back()->getDepth() &&
-           GenericParam->getIndex() == params.back()->getIndex() + 1) ||
-          (GenericParam->getDepth() > params.back()->getDepth() &&
-           GenericParam->getIndex() == 0)));
+
+#ifndef NDEBUG
+  if (params.empty()) {
+    assert(GenericParam->getDepth() == 0);
+    assert(GenericParam->getIndex() == 0);
+  } else {
+    assert((GenericParam->getDepth() == params.back()->getDepth() &&
+            GenericParam->getIndex() == params.back()->getIndex() + 1) ||
+           (GenericParam->getDepth() > params.back()->getDepth() &&
+            GenericParam->getIndex() == 0));
+  }
+#endif
 
   // Create a potential archetype for this type parameter.
   auto PA = new (Impl->Allocator) PotentialArchetype(GenericParam);
@@ -4225,8 +3988,16 @@ ConstraintResult GenericSignatureBuilder::expandConformanceRequirement(
                                             ProtocolDecl *proto,
                                             const RequirementSource *source,
                                             bool onlySameTypeConstraints) {
-  auto protocolSubMap = SubstitutionMap::getProtocolSubstitutions(
-      proto, selfType.getDependentType(*this), ProtocolConformanceRef(proto));
+  auto selfTy = selfType.getDependentType(*this);
+
+  auto subst = [&](Requirement req) -> Optional<Requirement> {
+    return req.subst(
+        [&](SubstitutableType *t) -> Type {
+          assert(isa<GenericTypeParamType>(t));
+          return selfTy;
+        },
+        MakeAbstractConformanceForGenericType());
+  };
 
   // Use the requirement signature to avoid rewalking the entire protocol.  This
   // cannot compute the requirement signature directly, because that may be
@@ -4240,7 +4011,7 @@ ConstraintResult GenericSignatureBuilder::expandConformanceRequirement(
       if (onlySameTypeConstraints && req.getKind() != RequirementKind::SameType)
         continue;
 
-      auto substReq = req.subst(protocolSubMap);
+      auto substReq = subst(req);
       auto reqResult = substReq
                            ? addRequirement(*substReq, innerSource, nullptr)
                            : ConstraintResult::Conflicting;
@@ -4254,7 +4025,7 @@ ConstraintResult GenericSignatureBuilder::expandConformanceRequirement(
     // Add all of the inherited protocol requirements, recursively.
     auto inheritedReqResult =
       addInheritedRequirements(proto, selfType.getUnresolvedType(), source,
-                               proto->getModuleContext());
+                               nullptr);
     if (isErrorResult(inheritedReqResult))
       return inheritedReqResult;
   }
@@ -4269,8 +4040,9 @@ ConstraintResult GenericSignatureBuilder::expandConformanceRequirement(
 
         auto innerSource = FloatingRequirementSource::viaProtocolRequirement(
             source, proto, reqRepr->getSeparatorLoc(), /*inferred=*/false);
-        addRequirement(req, reqRepr, innerSource,
-                       &protocolSubMap, nullptr);
+
+        if (auto substReq = subst(req))
+          addRequirement(*substReq, reqRepr, innerSource, nullptr);
         return false;
       });
 
@@ -4383,7 +4155,7 @@ ConstraintResult GenericSignatureBuilder::expandConformanceRequirement(
                     source, proto, SourceLoc(), /*inferred=*/true);
 
     auto rawReq = Requirement(RequirementKind::SameType, firstType, secondType);
-    if (auto req = rawReq.subst(protocolSubMap))
+    if (auto req = subst(rawReq))
       addRequirement(*req, inferredSameTypeSource, proto->getParentModule());
   };
 
@@ -4411,8 +4183,10 @@ ConstraintResult GenericSignatureBuilder::expandConformanceRequirement(
 
           auto innerSource = FloatingRequirementSource::viaProtocolRequirement(
               source, proto, reqRepr->getSeparatorLoc(), /*inferred=*/false);
-          addRequirement(req, reqRepr, innerSource, &protocolSubMap,
-                         /*inferForModule=*/nullptr);
+          if (auto substReq = subst(req)) {
+            addRequirement(*substReq, reqRepr, innerSource,
+                           /*inferForModule=*/nullptr);
+          }
           return false;
         });
 
@@ -4650,7 +4424,13 @@ bool GenericSignatureBuilder::updateSuperclass(
   // when the superclass constraint changes.
   auto updateSuperclassConformances = [&] {
     for (const auto &conforms : equivClass->conformsTo) {
-      (void)resolveSuperConformance(type, conforms.first);
+      bool explicitConformance = std::find_if(
+          conforms.second.begin(),
+          conforms.second.end(),
+          [](const Constraint<ProtocolDecl *> &constraint) {
+            return !constraint.source->isDerivedRequirement();
+          }) != conforms.second.end();
+      (void)resolveSuperConformance(type, conforms.first, explicitConformance);
     }
 
     // Eagerly resolve any existing nested types to their concrete forms (others
@@ -4676,7 +4456,7 @@ bool GenericSignatureBuilder::updateSuperclass(
 
     auto layout =
       LayoutConstraint::getLayoutConstraint(
-        superclass->getClassOrBoundGenericClass()->isObjC()
+        superclass->getClassOrBoundGenericClass()->usesObjCObjectModel()
           ? LayoutConstraintKind::Class
           : LayoutConstraintKind::NativeClass,
         getASTContext());
@@ -4835,7 +4615,8 @@ ConstraintResult GenericSignatureBuilder::addTypeRequirement(
   }
 
   // Check whether we have a reasonable constraint type at all.
-  if (!constraintType->isExistentialType() &&
+  if (!constraintType->is<ProtocolType>() &&
+      !constraintType->is<ProtocolCompositionType>() &&
       !constraintType->getClassOrBoundGenericClass()) {
     if (source.getLoc().isValid() && !constraintType->hasError()) {
       Impl->HadAnyError = true;
@@ -5049,8 +4830,15 @@ GenericSignatureBuilder::addSameTypeRequirementBetweenTypeParameters(
                                  equivClass2->concreteTypeConstraints.begin(),
                                  equivClass2->concreteTypeConstraints.end());
 
-    for (const auto &conforms : equivClass->conformsTo)
-      (void)resolveConcreteConformance(T1, conforms.first);
+    for (const auto &conforms : equivClass->conformsTo) {
+      bool explicitConformance = std::find_if(
+          conforms.second.begin(),
+          conforms.second.end(),
+          [](const Constraint<ProtocolDecl *> &constraint) {
+            return !constraint.source->isDerivedRequirement();
+          }) != conforms.second.end();
+      (void)resolveConcreteConformance(T1, conforms.first, explicitConformance);
+    }
   }
 
   // Make T1 the representative of T2, merging the equivalence classes.
@@ -5186,7 +4974,13 @@ ConstraintResult GenericSignatureBuilder::addSameTypeRequirementToConcrete(
   // Make sure the concrete type fulfills the conformance requirements of
   // this equivalence class.
   for (const auto &conforms : equivClass->conformsTo) {
-    if (!resolveConcreteConformance(type, conforms.first))
+    bool explicitConformance = std::find_if(
+        conforms.second.begin(),
+        conforms.second.end(),
+        [](const Constraint<ProtocolDecl *> &constraint) {
+          return !constraint.source->isDerivedRequirement();
+        }) != conforms.second.end();
+    if (!resolveConcreteConformance(type, conforms.first, explicitConformance))
       return ConstraintResult::Conflicting;
   }
 
@@ -5377,28 +5171,19 @@ ConstraintResult
 GenericSignatureBuilder::addRequirement(const Requirement &req,
                                         FloatingRequirementSource source,
                                         ModuleDecl *inferForModule) {
-  return addRequirement(req, nullptr, source, nullptr, inferForModule);
+  return addRequirement(req, nullptr, source, inferForModule);
 }
 
 ConstraintResult
 GenericSignatureBuilder::addRequirement(const Requirement &req,
                                         const RequirementRepr *reqRepr,
                                         FloatingRequirementSource source,
-                                        const SubstitutionMap *subMap,
                                         ModuleDecl *inferForModule) {
-  // Local substitution for types in the requirement.
-  auto subst = [&](Type t) {
-    if (subMap)
-      return t.subst(*subMap);
-
-    return t;
-  };
-
-  auto firstType = subst(req.getFirstType());
+  auto firstType = req.getFirstType();
   switch (req.getKind()) {
   case RequirementKind::Superclass:
   case RequirementKind::Conformance: {
-    auto secondType = subst(req.getSecondType());
+    auto secondType = req.getSecondType();
 
     if (inferForModule) {
       inferRequirements(*inferForModule, firstType,
@@ -5426,7 +5211,7 @@ GenericSignatureBuilder::addRequirement(const Requirement &req,
   }
 
   case RequirementKind::SameType: {
-    auto secondType = subst(req.getSecondType());
+    auto secondType = req.getSecondType();
 
     if (inferForModule) {
       inferRequirements(*inferForModule, firstType,
@@ -5480,12 +5265,8 @@ public:
     // Infer from generic typealiases.
     if (auto TypeAlias = dyn_cast<TypeAliasType>(ty.getPointer())) {
       auto decl = TypeAlias->getDecl();
-      auto genericSig = decl->getGenericSignature();
-      if (!genericSig)
-        return Action::Continue;
-
       auto subMap = TypeAlias->getSubstitutionMap();
-      for (const auto &rawReq : genericSig->getRequirements()) {
+      for (const auto &rawReq : decl->getGenericSignature().getRequirements()) {
         if (auto req = rawReq.subst(subMap))
           Builder.addRequirement(*req, source, nullptr);
       }
@@ -5559,7 +5340,7 @@ public:
 
     // Handle the requirements.
     // FIXME: Inaccurate TypeReprs.
-    for (const auto &rawReq : genericSig->getRequirements()) {
+    for (const auto &rawReq : genericSig.getRequirements()) {
       if (auto req = rawReq.subst(subMap))
         Builder.addRequirement(*req, source, nullptr);
     }
@@ -5887,6 +5668,11 @@ GenericSignatureBuilder::isValidRequirementDerivationPath(
 
     auto otherSubjectType = otherReq.getSubjectType();
 
+    auto *equivClass = resolveEquivalenceClass(otherSubjectType,
+                                         ArchetypeResolutionKind::AlreadyKnown);
+    assert(equivClass &&
+           "Explicit requirement names an unknown equivalence class?");
+
     // If our requirement is based on a path involving some other
     // redundant requirement, see if we can derive the redundant
     // requirement using requirements we haven't visited yet.
@@ -5905,11 +5691,6 @@ GenericSignatureBuilder::isValidRequirementDerivationPath(
       // redundant; there's no other derivation that would not be redundant.
       if (!otherSource->isDerivedNonRootRequirement())
         return None;
-
-      auto *equivClass = resolveEquivalenceClass(otherSubjectType,
-                                           ArchetypeResolutionKind::AlreadyKnown);
-      assert(equivClass &&
-             "Explicit requirement names an unknown equivalence class?");
 
       switch (otherReq.getKind()) {
       case RequirementKind::Conformance: {
@@ -5990,20 +5771,22 @@ GenericSignatureBuilder::isValidRequirementDerivationPath(
       }
     }
 
-    if (auto *depMemType = otherSubjectType->getAs<DependentMemberType>()) {
+    auto anchor = equivClass->getAnchor(*this, { });
+
+    if (auto *depMemType = anchor->getAs<DependentMemberType>()) {
       // If 'req' is based on some other conformance requirement
       // `T.[P.]A : Q', we want to make sure that we have a
       // non-redundant derivation for 'T : P'.
       auto baseType = depMemType->getBase();
       auto *proto = depMemType->getAssocType()->getProtocol();
 
-      auto *equivClass = resolveEquivalenceClass(baseType,
+      auto *baseEquivClass = resolveEquivalenceClass(baseType,
                                            ArchetypeResolutionKind::AlreadyKnown);
-      assert(equivClass &&
+      assert(baseEquivClass &&
              "Explicit requirement names an unknown equivalence class?");
 
-      auto found = equivClass->conformsTo.find(proto);
-      assert(found != equivClass->conformsTo.end());
+      auto found = baseEquivClass->conformsTo.find(proto);
+      assert(found != baseEquivClass->conformsTo.end());
 
       bool foundValidDerivation = false;
       for (const auto &constraint : found->second) {
@@ -6053,7 +5836,7 @@ void GenericSignatureBuilder::checkIfRequirementCanBeDerived(
 }
 
 static bool involvesNonSelfSubjectTypes(const RequirementSource *source) {
-  while (source->kind != RequirementSource::RequirementSignatureSelf) {
+  while (source && source->kind != RequirementSource::RequirementSignatureSelf) {
     if (source->isProtocolRequirement() &&
         !source->getStoredType()->is<GenericTypeParamType>())
       return true;
@@ -6625,8 +6408,16 @@ GenericSignatureBuilder::finalize(TypeArrayView<GenericTypeParamType> genericPar
       auto source = constraint.source;
       auto loc = source->getLoc();
 
+      // FIXME: The constraint string is printed directly here because
+      // the current default is to not print `any` for existential
+      // types, but this error message is super confusing without `any`
+      // if the user wrote it explicitly.
+      PrintOptions options;
+      options.PrintExplicitAny = true;
+      auto constraintString = constraintType.getString(options);
+
       Diags.diagnose(loc, diag::requires_conformance_nonprotocol,
-                     subjectType, constraintType);
+                     subjectType, constraintString);
       
       auto getNameWithoutSelf = [&](std::string subjectTypeName) {
         std::string selfSubstring = "Self.";
@@ -6644,7 +6435,7 @@ GenericSignatureBuilder::finalize(TypeArrayView<GenericTypeParamType> genericPar
         auto subjectTypeName = subjectType.getString();
         auto subjectTypeNameWithoutSelf = getNameWithoutSelf(subjectTypeName);
         Diags.diagnose(loc, diag::requires_conformance_nonprotocol_fixit,
-                       subjectTypeNameWithoutSelf, constraintType.getString())
+                       subjectTypeNameWithoutSelf, constraintString)
              .fixItReplace(loc, " == ");
       }
     }
@@ -8099,43 +7890,9 @@ static Optional<Requirement> createRequirement(RequirementKind kind,
   }
 }
 
-/// Determine the canonical ordering of requirements.
-static unsigned getRequirementKindOrder(RequirementKind kind) {
-  switch (kind) {
-  case RequirementKind::Conformance: return 2;
-  case RequirementKind::Superclass: return 0;
-  case RequirementKind::SameType: return 3;
-  case RequirementKind::Layout: return 1;
-  }
-  llvm_unreachable("unhandled kind");
-}
-
 static int compareRequirements(const Requirement *lhsPtr,
                                const Requirement *rhsPtr) {
-  auto &lhs = *lhsPtr;
-  auto &rhs = *rhsPtr;
-
-  int compareLHS =
-    compareDependentTypes(lhs.getFirstType(), rhs.getFirstType());
-
-  if (compareLHS != 0)
-    return compareLHS;
-
-  int compareKind = (getRequirementKindOrder(lhs.getKind()) -
-                     getRequirementKindOrder(rhs.getKind()));
-
-  if (compareKind != 0)
-    return compareKind;
-
-  // We should only have multiple conformance requirements.
-  assert(lhs.getKind() == RequirementKind::Conformance);
-
-  int compareProtos =
-    TypeDecl::compare(lhs.getProtocolDecl(), rhs.getProtocolDecl());
-
-  assert(compareProtos != 0 && "Duplicate conformance requirement");
-
-  return compareProtos;
+  return lhsPtr->compare(*rhsPtr);
 }
 
 void GenericSignatureBuilder::enumerateRequirements(
@@ -8260,12 +8017,10 @@ void GenericSignatureBuilder::dump(llvm::raw_ostream &out) {
 }
 
 void GenericSignatureBuilder::addGenericSignature(GenericSignature sig) {
-  if (!sig) return;
-
-  for (auto param : sig->getGenericParams())
+  for (auto param : sig.getGenericParams())
     addGenericParameter(param);
 
-  for (auto &reqt : sig->getRequirements())
+  for (auto &reqt : sig.getRequirements())
     addRequirement(reqt, FloatingRequirementSource::forAbstract(), nullptr);
 }
 
@@ -8275,7 +8030,10 @@ static void checkGenericSignature(CanGenericSignature canSig,
                                   GenericSignatureBuilder &builder) {
   PrettyStackTraceGenericSignature debugStack("checking", canSig);
 
-  auto canonicalRequirements = canSig->getRequirements();
+  auto canonicalRequirements = canSig.getRequirements();
+
+  // We collect conformance requirements to check that they're minimal.
+  llvm::SmallDenseMap<CanType, SmallVector<ProtocolDecl *, 2>, 2> conformances;
 
   // Check that the signature is canonical.
   for (unsigned idx : indices(canonicalRequirements)) {
@@ -8327,6 +8085,10 @@ static void checkGenericSignature(CanGenericSignature canSig,
              "Left-hand side must be a type parameter");
       assert(isa<ProtocolType>(reqt.getSecondType().getPointer()) &&
              "Right-hand side of conformance isn't a protocol type");
+
+      // Collect all conformance requirements on each type parameter.
+      conformances[CanType(reqt.getFirstType())].push_back(
+          reqt.getProtocolDecl());
       break;
     }
 
@@ -8366,8 +8128,24 @@ static void checkGenericSignature(CanGenericSignature canSig,
              "Concrete subject type should not have any other requirements");
     }
 
-    assert(compareRequirements(&prevReqt, &reqt) < 0 &&
+    assert(prevReqt.compare(reqt) < 0 &&
            "Out-of-order requirements");
+  }
+
+  // Make sure we don't have redundant protocol conformance requirements.
+  for (auto pair : conformances) {
+    const auto &protos = pair.second;
+    auto canonicalProtos = protos;
+
+    // canonicalizeProtocols() will sort them and filter out any protocols that
+    // are refined by other protocols in the list. It should be a no-op at this
+    // point.
+    ProtocolType::canonicalizeProtocols(canonicalProtos);
+
+    assert(protos.size() == canonicalProtos.size() &&
+           "redundant conformance requirements");
+    assert(std::equal(protos.begin(), protos.end(), canonicalProtos.begin()) &&
+           "out-of-order conformance requirements");
   }
 }
 #endif
@@ -8467,24 +8245,42 @@ GenericSignature GenericSignatureBuilder::rebuildSignatureWithoutRedundantRequir
     }
 
     auto subjectType = req.getSubjectType();
-    subjectType = stripBoundDependentMemberTypes(subjectType);
-    auto resolvedSubjectType =
-        resolveDependentMemberTypes(*this, subjectType,
-                                    ArchetypeResolutionKind::WellFormed);
+    auto resolvedSubject =
+        maybeResolveEquivalenceClass(subjectType,
+                                     ArchetypeResolutionKind::WellFormed,
+                                     /*wantExactPotentialArchetype=*/false);
+
+    auto *resolvedEquivClass = resolvedSubject.getEquivalenceClass(*this);
+    Type resolvedSubjectType;
+    if (resolvedEquivClass != nullptr)
+      resolvedSubjectType = resolvedEquivClass->getAnchor(*this, { });
 
     // This can occur if the combination of a superclass requirement and
     // protocol conformance requirement force a type to become concrete.
     //
     // FIXME: Is there a more principled formulation of this?
-    if (req.getKind() == RequirementKind::Superclass &&
-        !resolvedSubjectType->isTypeParameter()) {
-      newBuilder.addRequirement(Requirement(RequirementKind::SameType,
-                                            subjectType, resolvedSubjectType),
-                                getRebuiltSource(req.getSource()), nullptr);
-      continue;
+    if (req.getKind() == RequirementKind::Superclass) {
+      if (resolvedSubject.getAsConcreteType()) {
+        auto unresolvedSubjectType = stripBoundDependentMemberTypes(subjectType);
+        newBuilder.addRequirement(Requirement(RequirementKind::SameType,
+                                              unresolvedSubjectType,
+                                              resolvedSubject.getAsConcreteType()),
+                                  getRebuiltSource(req.getSource()), nullptr);
+        continue;
+      }
+
+      if (resolvedEquivClass->concreteType) {
+        auto unresolvedSubjectType = stripBoundDependentMemberTypes(
+            resolvedSubjectType);
+        newBuilder.addRequirement(Requirement(RequirementKind::SameType,
+                                              unresolvedSubjectType,
+                                              resolvedEquivClass->concreteType),
+                                  getRebuiltSource(req.getSource()), nullptr);
+        continue;
+      }
     }
 
-    assert(resolvedSubjectType->isTypeParameter());
+    assert(resolvedSubjectType && resolvedSubjectType->isTypeParameter());
 
     if (auto optReq = createRequirement(req.getKind(), resolvedSubjectType,
                                         req.getRHS(), getGenericParams())) {
@@ -8523,6 +8319,40 @@ GenericSignature GenericSignatureBuilder::rebuildSignatureWithoutRedundantRequir
       }
     };
 
+    // If we have a same-type requirement where the right hand side is concrete,
+    // canonicalize the left hand side, in case dropping some redundant
+    // conformance requirement turns the original left hand side into an
+    // unresolvable type.
+    if (!req.getRHS().get<Type>()->isTypeParameter()) {
+      auto resolvedSubject =
+          maybeResolveEquivalenceClass(req.getSubjectType(),
+                                       ArchetypeResolutionKind::WellFormed,
+                                       /*wantExactPotentialArchetype=*/false);
+
+      auto *resolvedEquivClass = resolvedSubject.getEquivalenceClass(*this);
+      auto resolvedSubjectType = resolvedEquivClass->getAnchor(*this, { });
+
+      auto constraintType = resolveType(req.getRHS().get<Type>());
+
+      auto newReq = stripBoundDependentMemberTypes(
+          Requirement(RequirementKind::SameType,
+                      resolvedSubjectType, constraintType));
+
+      if (Impl->DebugRedundantRequirements) {
+        llvm::dbgs() << "=> ";
+        newReq.dump(llvm::dbgs());
+        llvm::dbgs() << "\n";
+      }
+      newBuilder.addRequirement(newReq, getRebuiltSource(req.getSource()),
+                                nullptr);
+
+      continue;
+    }
+
+    // Otherwise, we can't canonicalize the two sides of the requirement, since
+    // doing so will produce a trivial same-type requirement T == T. Instead,
+    // apply some ad-hoc rules to improve the odds that the requirement will
+    // resolve in the rebuilt GSB.
     auto subjectType = resolveType(req.getSubjectType());
     auto constraintType = resolveType(req.getRHS().get<Type>());
 
@@ -8546,6 +8376,10 @@ GenericSignature GenericSignatureBuilder::rebuildSignatureWithoutRedundantRequir
   return std::move(newBuilder).computeGenericSignature(
       allowConcreteGenericParams,
       requirementSignatureSelfProto);
+}
+
+bool GenericSignatureBuilder::hadAnyError() const {
+  return Impl->HadAnyError;
 }
 
 GenericSignature GenericSignatureBuilder::computeGenericSignature(
@@ -8610,7 +8444,10 @@ GenericSignature GenericSignatureBuilder::computeGenericSignature(
   auto sig = GenericSignature::get(getGenericParams(), requirements);
 
 #ifndef NDEBUG
-  if (!Impl->HadAnyError) {
+  bool hadAnyError = Impl->HadAnyError;
+
+  if (requirementSignatureSelfProto &&
+      !hadAnyError) {
     checkGenericSignature(sig.getCanonicalSignature(), *this);
   }
 #endif
@@ -8633,120 +8470,16 @@ GenericSignature GenericSignatureBuilder::computeGenericSignature(
   // anything more.
   Impl.reset();
 
+#ifndef NDEBUG
+  if (!requirementSignatureSelfProto &&
+      !hadAnyError) {
+    sig.verify();
+  }
+#endif
+
   return sig;
 }
 
-#pragma mark Generic signature verification
-
-void GenericSignatureBuilder::verifyGenericSignature(ASTContext &context,
-                                                     GenericSignature sig) {
-  llvm::errs() << "Validating generic signature: ";
-  sig->print(llvm::errs());
-  llvm::errs() << "\n";
-
-  // Try building a new signature having the same requirements.
-  auto genericParams = sig->getGenericParams();
-  auto requirements = sig->getRequirements();
-
-  {
-    PrettyStackTraceGenericSignature debugStack("verifying", sig);
-
-    // Form a new generic signature builder.
-    GenericSignatureBuilder builder(context);
-
-    // Add the generic parameters.
-    for (auto gp : genericParams)
-      builder.addGenericParameter(gp);
-
-    // Add the requirements.
-    auto source = FloatingRequirementSource::forAbstract();
-    for (auto req : requirements)
-      builder.addRequirement(req, source, nullptr);
-
-    // If there were any errors, the signature was invalid.
-    if (builder.Impl->HadAnyError) {
-      context.Diags.diagnose(SourceLoc(), diag::generic_signature_not_valid,
-                             sig->getAsString());
-    }
-
-    // Form a generic signature from the result.
-    auto newSig =
-      std::move(builder).computeGenericSignature(
-                                      /*allowConcreteGenericParams=*/true);
-
-    // The new signature should be equal.
-    if (!newSig->isEqual(sig)) {
-      context.Diags.diagnose(SourceLoc(), diag::generic_signature_not_equal,
-                             sig->getAsString(), newSig->getAsString());
-    }
-  }
-
-  // Try removing each requirement in turn.
-  for (unsigned victimIndex : indices(requirements)) {
-    PrettyStackTraceGenericSignature debugStack("verifying", sig, victimIndex);
-
-    // Form a new generic signature builder.
-    GenericSignatureBuilder builder(context);
-
-    // Add the generic parameters.
-    for (auto gp : genericParams)
-      builder.addGenericParameter(gp);
-
-    // Add the requirements *except* the victim.
-    auto source = FloatingRequirementSource::forAbstract();
-    for (unsigned i : indices(requirements)) {
-      if (i != victimIndex)
-        builder.addRequirement(requirements[i], source, nullptr);
-    }
-
-    // If there were any errors, we formed an invalid signature, so
-    // just continue.
-    if (builder.Impl->HadAnyError) continue;
-
-    // Form a generic signature from the result.
-    auto newSig =
-      std::move(builder).computeGenericSignature(
-                                      /*allowConcreteGenericParams=*/true);
-
-    // If the removed requirement is satisfied by the new generic signature,
-    // it is redundant. Complain.
-    if (newSig->isRequirementSatisfied(requirements[victimIndex])) {
-      SmallString<32> reqString;
-      {
-        llvm::raw_svector_ostream out(reqString);
-        requirements[victimIndex].print(out, PrintOptions());
-      }
-      context.Diags.diagnose(SourceLoc(), diag::generic_signature_not_minimal,
-                             reqString, sig->getAsString());
-    }
-  }
-}
-
-void GenericSignatureBuilder::verifyGenericSignaturesInModule(
-                                                        ModuleDecl *module) {
-  LoadedFile *loadedFile = nullptr;
-  for (auto fileUnit : module->getFiles()) {
-    loadedFile = dyn_cast<LoadedFile>(fileUnit);
-    if (loadedFile) break;
-  }
-
-  if (!loadedFile) return;
-
-  // Check all of the (canonical) generic signatures.
-  SmallVector<GenericSignature, 8> allGenericSignatures;
-  SmallPtrSet<CanGenericSignature, 4> knownGenericSignatures;
-  (void)loadedFile->getAllGenericSignatures(allGenericSignatures);
-  ASTContext &context = module->getASTContext();
-  for (auto genericSig : allGenericSignatures) {
-    // Check whether this is the first time we've checked this (canonical)
-    // signature.
-    auto canGenericSig = genericSig.getCanonicalSignature();
-    if (!knownGenericSignatures.insert(canGenericSig).second) continue;
-
-    verifyGenericSignature(context, canGenericSig);
-  }
-}
-      
 /// Check whether the inputs to the \c AbstractGenericSignatureRequest are
 /// all canonical.
 static bool isCanonicalRequest(GenericSignature baseSignature,
@@ -8768,16 +8501,17 @@ static bool isCanonicalRequest(GenericSignature baseSignature,
   return true;
 }
 
-GenericSignature
+GenericSignatureWithError
 AbstractGenericSignatureRequest::evaluate(
          Evaluator &evaluator,
-         const GenericSignatureImpl *baseSignature,
+         const GenericSignatureImpl *baseSignatureImpl,
          SmallVector<GenericTypeParamType *, 2> addedParameters,
          SmallVector<Requirement, 2> addedRequirements) const {
+  GenericSignature baseSignature = GenericSignature{baseSignatureImpl};
   // If nothing is added to the base signature, just return the base
   // signature.
   if (addedParameters.empty() && addedRequirements.empty())
-    return baseSignature;
+    return GenericSignatureWithError(baseSignature, /*hadError=*/false);
 
   ASTContext &ctx = addedParameters.empty()
       ? addedRequirements.front().getFirstType()->getASTContext()
@@ -8786,24 +8520,20 @@ AbstractGenericSignatureRequest::evaluate(
   // If there are no added requirements, we can form the signature directly
   // with the added parameters.
   if (addedRequirements.empty()) {
-    ArrayRef<Requirement> requirements;
-    if (baseSignature) {
-      addedParameters.insert(addedParameters.begin(),
-                             baseSignature->getGenericParams().begin(),
-                             baseSignature->getGenericParams().end());
-      requirements = baseSignature->getRequirements();
-    }
+    addedParameters.insert(addedParameters.begin(),
+                           baseSignature.getGenericParams().begin(),
+                           baseSignature.getGenericParams().end());
 
-    return GenericSignature::get(addedParameters, requirements);
+    auto result = GenericSignature::get(addedParameters,
+                                        baseSignature.getRequirements());
+    return GenericSignatureWithError(result, /*hadError=*/false);
   }
 
   // If the request is non-canonical, we won't need to build our own
   // generic signature builder.
   if (!isCanonicalRequest(baseSignature, addedParameters, addedRequirements)) {
     // Canonicalize the inputs so we can form the canonical request.
-    GenericSignature canBaseSignature;
-    if (baseSignature)
-      canBaseSignature = baseSignature->getCanonicalSignature();
+    auto canBaseSignature = baseSignature.getCanonicalSignature();
 
     SmallVector<GenericTypeParamType *, 2> canAddedParameters;
     canAddedParameters.reserve(addedParameters.size());
@@ -8819,29 +8549,31 @@ AbstractGenericSignatureRequest::evaluate(
     }
 
     // Build the canonical signature.
-    auto canSignatureResult = evaluator(
+    auto canSignatureResult = evaluateOrDefault(
+        ctx.evaluator,
         AbstractGenericSignatureRequest{
           canBaseSignature.getPointer(), std::move(canAddedParameters),
-          std::move(canAddedRequirements)});
-    if (!canSignatureResult || !*canSignatureResult)
-      return GenericSignature();
+          std::move(canAddedRequirements)},
+        GenericSignatureWithError());
+    if (!canSignatureResult.getPointer())
+      return GenericSignatureWithError();
 
     // Substitute in the original generic parameters to form the sugared
     // result the original request wanted.
-    auto canSignature = *canSignatureResult;
+    auto canSignature = canSignatureResult.getPointer();
     SmallVector<GenericTypeParamType *, 2> resugaredParameters;
-    resugaredParameters.reserve(canSignature->getGenericParams().size());
+    resugaredParameters.reserve(canSignature.getGenericParams().size());
     if (baseSignature) {
-      resugaredParameters.append(baseSignature->getGenericParams().begin(),
-                                 baseSignature->getGenericParams().end());
+      resugaredParameters.append(baseSignature.getGenericParams().begin(),
+                                 baseSignature.getGenericParams().end());
     }
     resugaredParameters.append(addedParameters.begin(), addedParameters.end());
     assert(resugaredParameters.size() ==
-               canSignature->getGenericParams().size());
+               canSignature.getGenericParams().size());
 
     SmallVector<Requirement, 2> resugaredRequirements;
-    resugaredRequirements.reserve(canSignature->getRequirements().size());
-    for (const auto &req : canSignature->getRequirements()) {
+    resugaredRequirements.reserve(canSignature.getRequirements().size());
+    for (const auto &req : canSignature.getRequirements()) {
       auto resugaredReq = req.subst(
           [&](SubstitutableType *type) {
             if (auto gp = dyn_cast<GenericTypeParamType>(type)) {
@@ -8855,157 +8587,324 @@ AbstractGenericSignatureRequest::evaluate(
       resugaredRequirements.push_back(*resugaredReq);
     }
 
-    return GenericSignature::get(resugaredParameters, resugaredRequirements);
+    return GenericSignatureWithError(
+        GenericSignature::get(resugaredParameters, resugaredRequirements),
+        canSignatureResult.getInt());
   }
 
-  // Create a generic signature that will form the signature.
-  GenericSignatureBuilder builder(ctx);
-  if (baseSignature)
-    builder.addGenericSignature(baseSignature);
+  auto buildViaGSB = [&]() {
+    // Create a generic signature that will form the signature.
+    GenericSignatureBuilder builder(ctx);
+    if (baseSignature)
+      builder.addGenericSignature(baseSignature);
 
-  auto source =
-    GenericSignatureBuilder::FloatingRequirementSource::forAbstract();
+    auto source =
+      GenericSignatureBuilder::FloatingRequirementSource::forAbstract();
 
-  for (auto param : addedParameters)
-    builder.addGenericParameter(param);
+    for (auto param : addedParameters)
+      builder.addGenericParameter(param);
 
-  for (const auto &req : addedRequirements)
-    builder.addRequirement(req, source, nullptr);
+    for (const auto &req : addedRequirements)
+      builder.addRequirement(req, source, nullptr);
 
-  return std::move(builder).computeGenericSignature(
-      /*allowConcreteGenericParams=*/true);
+    bool hadError = builder.hadAnyError();
+    auto result = std::move(builder).computeGenericSignature(
+        /*allowConcreteGenericParams=*/true);
+    return GenericSignatureWithError(result, hadError);
+  };
+
+  auto buildViaRQM = [&]() {
+    return evaluateOrDefault(
+        ctx.evaluator,
+        AbstractGenericSignatureRequestRQM{
+          baseSignature.getPointer(),
+          std::move(addedParameters),
+          std::move(addedRequirements)},
+        GenericSignatureWithError());
+  };
+
+  switch (ctx.LangOpts.RequirementMachineAbstractSignatures) {
+  case RequirementMachineMode::Disabled:
+    return buildViaGSB();
+
+  case RequirementMachineMode::Enabled:
+    return buildViaRQM();
+
+  case RequirementMachineMode::Verify: {
+    auto rqmResult = buildViaRQM();
+    auto gsbResult = buildViaGSB();
+
+    if (!rqmResult.getPointer() && !gsbResult.getPointer())
+      return gsbResult;
+
+    if (!rqmResult.getPointer()->isEqual(gsbResult.getPointer())) {
+      llvm::errs() << "RequirementMachine generic signature minimization is broken:\n";
+      llvm::errs() << "RequirementMachine says:      " << rqmResult.getPointer() << "\n";
+      llvm::errs() << "GenericSignatureBuilder says: " << gsbResult.getPointer() << "\n";
+
+      abort();
+    }
+
+    return gsbResult;
+  }
+  }
 }
 
-GenericSignature
+GenericSignatureWithError
 InferredGenericSignatureRequest::evaluate(
-        Evaluator &evaluator, ModuleDecl *parentModule,
+        Evaluator &evaluator,
+        ModuleDecl *parentModule,
         const GenericSignatureImpl *parentSig,
-        GenericParamSource paramSource,
+        GenericParamList *genericParams,
+        WhereClauseOwner whereClause,
         SmallVector<Requirement, 2> addedRequirements,
         SmallVector<TypeLoc, 2> inferenceSources,
         bool allowConcreteGenericParams) const {
-      
-  GenericSignatureBuilder builder(parentModule->getASTContext());
-      
-  // If there is a parent context, add the generic parameters and requirements
-  // from that context.
-  builder.addGenericSignature(parentSig);
+  auto buildViaGSB = [&]() {
+    GenericSignatureBuilder builder(parentModule->getASTContext());
+        
+    // If there is a parent context, add the generic parameters and requirements
+    // from that context.
+    builder.addGenericSignature(parentSig);
 
-  DeclContext *lookupDC = nullptr;
+    DeclContext *lookupDC = nullptr;
 
-  const auto visitRequirement = [&](const Requirement &req,
-                                    RequirementRepr *reqRepr) {
-    const auto source = FloatingRequirementSource::forExplicit(
-      reqRepr->getSeparatorLoc());
+    const auto visitRequirement = [&](const Requirement &req,
+                                      RequirementRepr *reqRepr) {
+      const auto source = FloatingRequirementSource::forExplicit(
+        reqRepr->getSeparatorLoc());
 
-    // If we're extending a protocol and adding a redundant requirement,
-    // for example, `extension Foo where Self: Foo`, then emit a
-    // diagnostic.
+      // If we're extending a protocol and adding a redundant requirement,
+      // for example, `extension Foo where Self: Foo`, then emit a
+      // diagnostic.
 
-    if (auto decl = lookupDC->getAsDecl()) {
-      if (auto extDecl = dyn_cast<ExtensionDecl>(decl)) {
-        auto extType = extDecl->getDeclaredInterfaceType();
-        auto extSelfType = extDecl->getSelfInterfaceType();
-        auto reqLHSType = req.getFirstType();
-        auto reqRHSType = req.getSecondType();
+      if (auto decl = lookupDC->getAsDecl()) {
+        if (auto extDecl = dyn_cast<ExtensionDecl>(decl)) {
+          auto extType = extDecl->getDeclaredInterfaceType();
+          auto extSelfType = extDecl->getSelfInterfaceType();
+          auto reqLHSType = req.getFirstType();
+          auto reqRHSType = req.getSecondType();
 
-        if (extType->isExistentialType() &&
-            reqLHSType->isEqual(extSelfType) &&
-            reqRHSType->isEqual(extType)) {
+          if (extType->isExistentialType() &&
+              reqLHSType->isEqual(extSelfType) &&
+              reqRHSType->isEqual(extType)) {
 
-          auto &ctx = extDecl->getASTContext();
-          ctx.Diags.diagnose(extDecl->getLoc(),
-                             diag::protocol_extension_redundant_requirement,
-                             extType->getString(),
-                             extSelfType->getString(),
-                             reqRHSType->getString());
+            auto &ctx = extDecl->getASTContext();
+            ctx.Diags.diagnose(extDecl->getLoc(),
+                               diag::protocol_extension_redundant_requirement,
+                               extType->getString(),
+                               extSelfType->getString(),
+                               reqRHSType->getString());
+          }
         }
+      }
+
+      builder.addRequirement(req, reqRepr, source,
+                             lookupDC->getParentModule());
+      return false;
+    };
+
+    if (genericParams) {
+      // Extensions never have a parent signature.
+      if (genericParams->getOuterParameters())
+        assert(parentSig == nullptr);
+
+      // Type check the generic parameters, treating all generic type
+      // parameters as dependent, unresolved.
+      SmallVector<GenericParamList *, 2> gpLists;
+      for (auto *outerParams = genericParams;
+           outerParams != nullptr;
+           outerParams = outerParams->getOuterParameters()) {
+        gpLists.push_back(outerParams);
+      }
+
+      // The generic parameter lists MUST appear from innermost to outermost.
+      // We walk them backwards to order outer requirements before
+      // inner requirements.
+      for (auto &genericParams : llvm::reverse(gpLists)) {
+        assert(genericParams->size() > 0 &&
+               "Parsed an empty generic parameter list?");
+
+        // First, add the generic parameters to the generic signature builder.
+        // Do this before checking the inheritance clause, since it may
+        // itself be dependent on one of these parameters.
+        for (const auto param : *genericParams)
+          builder.addGenericParameter(param);
+
+        // Add the requirements for each of the generic parameters to the builder.
+        // Now, check the inheritance clauses of each parameter.
+        for (const auto param : *genericParams)
+          builder.addGenericParameterRequirements(param);
+
+        // Determine where and how to perform name lookup.
+        lookupDC = genericParams->begin()[0]->getDeclContext();
+
+        // Add the requirements clause to the builder.
+        WhereClauseOwner(lookupDC, genericParams)
+          .visitRequirements(TypeResolutionStage::Structural,
+                             visitRequirement);
       }
     }
 
-    builder.addRequirement(req, reqRepr, source, nullptr,
-                            lookupDC->getParentModule());
-    return false;
+    if (whereClause) {
+      lookupDC = whereClause.dc;
+      std::move(whereClause).visitRequirements(
+          TypeResolutionStage::Structural, visitRequirement);
+    }
+        
+    /// Perform any remaining requirement inference.
+    for (auto sourcePair : inferenceSources) {
+      auto *typeRepr = sourcePair.getTypeRepr();
+      auto source =
+        FloatingRequirementSource::forInferred(
+          typeRepr ? typeRepr->getStartLoc() : SourceLoc());
+
+      builder.inferRequirements(*parentModule,
+                                sourcePair.getType(),
+                                source);
+    }
+    
+    // Finish by adding any remaining requirements.
+    auto source =
+      FloatingRequirementSource::forInferred(SourceLoc());
+        
+    for (const auto &req : addedRequirements)
+      builder.addRequirement(req, source, parentModule);
+
+    bool hadError = builder.hadAnyError();
+    auto result = std::move(builder).computeGenericSignature(
+        allowConcreteGenericParams);
+    return GenericSignatureWithError(result, hadError);
   };
 
-  GenericParamList *genericParams = nullptr;
-  if (auto params = paramSource.dyn_cast<GenericParamList *>())
-      genericParams = params;
-  else
-      genericParams = paramSource.get<GenericContext *>()->getGenericParams();
+  auto &ctx = parentModule->getASTContext();
 
-  if (genericParams) {
-    // Extensions never have a parent signature.
-    if (genericParams->getOuterParameters())
-      assert(parentSig == nullptr);
+  auto buildViaRQM = [&]() {
+    return evaluateOrDefault(
+        ctx.evaluator,
+        InferredGenericSignatureRequestRQM{
+          parentModule,
+          parentSig,
+          genericParams,
+          whereClause,
+          addedRequirements,
+          inferenceSources,
+          allowConcreteGenericParams},
+        GenericSignatureWithError());
+  };
 
-    // Type check the generic parameters, treating all generic type
-    // parameters as dependent, unresolved.
-    SmallVector<GenericParamList *, 2> gpLists;
-    for (auto *outerParams = genericParams;
-         outerParams != nullptr;
-         outerParams = outerParams->getOuterParameters()) {
-      gpLists.push_back(outerParams);
+  switch (ctx.LangOpts.RequirementMachineInferredSignatures) {
+  case RequirementMachineMode::Disabled:
+    return buildViaGSB();
+
+  case RequirementMachineMode::Enabled:
+    return buildViaRQM();
+
+  case RequirementMachineMode::Verify: {
+    auto rqmResult = buildViaRQM();
+    auto gsbResult = buildViaGSB();
+
+    if (!rqmResult.getPointer() && !gsbResult.getPointer())
+      return gsbResult;
+
+    if (!rqmResult.getPointer()->isEqual(gsbResult.getPointer())) {
+      llvm::errs() << "RequirementMachine generic signature minimization is broken:\n";
+      llvm::errs() << "RequirementMachine says:      " << rqmResult.getPointer() << "\n";
+      llvm::errs() << "GenericSignatureBuilder says: " << gsbResult.getPointer() << "\n";
+
+      abort();
     }
 
-    // The generic parameter lists MUST appear from innermost to outermost.
-    // We walk them backwards to order outer requirements before
-    // inner requirements.
-    for (auto &genericParams : llvm::reverse(gpLists)) {
-      assert(genericParams->size() > 0 &&
-             "Parsed an empty generic parameter list?");
+    return gsbResult;
+  }
+  }
+}
 
-      // First, add the generic parameters to the generic signature builder.
-      // Do this before checking the inheritance clause, since it may
-      // itself be dependent on one of these parameters.
-      for (const auto param : *genericParams)
-        builder.addGenericParameter(param);
+ArrayRef<Requirement>
+RequirementSignatureRequest::evaluate(Evaluator &evaluator,
+                                      ProtocolDecl *proto) const {
+  ASTContext &ctx = proto->getASTContext();
 
-      // Add the requirements for each of the generic parameters to the builder.
-      // Now, check the inheritance clauses of each parameter.
-      for (const auto param : *genericParams)
-        builder.addGenericParameterRequirements(param);
+  // First check if we have a deserializable requirement signature.
+  if (proto->hasLazyRequirementSignature()) {
+    ++NumLazyRequirementSignaturesLoaded;
+    // FIXME: (transitional) increment the redundant "always-on" counter.
+    if (ctx.Stats)
+      ++ctx.Stats->getFrontendCounters().NumLazyRequirementSignaturesLoaded;
 
-      // Determine where and how to perform name lookup.
-      lookupDC = genericParams->begin()[0]->getDeclContext();
+    auto contextData = static_cast<LazyProtocolData *>(
+        ctx.getOrCreateLazyContextData(proto, nullptr));
 
-      // Add the requirements clause to the builder.
-      WhereClauseOwner(lookupDC, genericParams)
-        .visitRequirements(TypeResolutionStage::Structural,
-                           visitRequirement);
+    SmallVector<Requirement, 8> requirements;
+    contextData->loader->loadRequirementSignature(
+        proto, contextData->requirementSignatureData, requirements);
+    if (requirements.empty())
+      return None;
+    return ctx.AllocateCopy(requirements);
+  }
+
+  auto buildViaGSB = [&]() {
+    GenericSignatureBuilder builder(proto->getASTContext());
+
+    // Add all of the generic parameters.
+    for (auto gp : *proto->getGenericParams())
+      builder.addGenericParameter(gp);
+
+    // Add the conformance of 'self' to the protocol.
+    auto selfType =
+      proto->getSelfInterfaceType()->castTo<GenericTypeParamType>();
+    auto requirement =
+      Requirement(RequirementKind::Conformance, selfType,
+                  proto->getDeclaredInterfaceType());
+
+    builder.addRequirement(
+            requirement,
+            GenericSignatureBuilder::RequirementSource::forRequirementSignature(
+                                                        builder, selfType, proto),
+            nullptr);
+
+    auto reqSignature = std::move(builder).computeGenericSignature(
+                          /*allowConcreteGenericParams=*/false,
+                          /*requirementSignatureSelfProto=*/proto);
+    return reqSignature.getRequirements();
+  };
+
+  auto buildViaRQM = [&]() {
+    return evaluateOrDefault(
+        ctx.evaluator,
+        RequirementSignatureRequestRQM{const_cast<ProtocolDecl *>(proto)},
+        ArrayRef<Requirement>());
+  };
+
+  switch (ctx.LangOpts.RequirementMachineProtocolSignatures) {
+  case RequirementMachineMode::Disabled:
+    return buildViaGSB();
+
+  case RequirementMachineMode::Enabled:
+    return buildViaRQM();
+
+  case RequirementMachineMode::Verify: {
+    auto rqmResult = buildViaRQM();
+    auto gsbResult = buildViaGSB();
+
+    if (rqmResult.size() != gsbResult.size() ||
+        !std::equal(rqmResult.begin(), rqmResult.end(),
+                    gsbResult.begin())) {
+      llvm::errs() << "RequirementMachine protocol signature minimization is broken:\n";
+      llvm::errs() << "Protocol: " << proto->getName() << "\n";
+
+      auto rqmSig = GenericSignature::get(
+          proto->getGenericSignature().getGenericParams(), rqmResult);
+      llvm::errs() << "RequirementMachine says:      " << rqmSig << "\n";
+
+      auto gsbSig = GenericSignature::get(
+          proto->getGenericSignature().getGenericParams(), gsbResult);
+      llvm::errs() << "GenericSignatureBuilder says: " << gsbSig << "\n";
+
+      abort();
     }
-  }
 
-  if (auto *ctx = paramSource.dyn_cast<GenericContext *>()) {
-    // The declaration might have a trailing where clause.
-    if (auto *where = ctx->getTrailingWhereClause()) {
-      // Determine where and how to perform name lookup.
-      lookupDC = ctx;
-
-      WhereClauseOwner(lookupDC, where).visitRequirements(
-        TypeResolutionStage::Structural, visitRequirement);
-    }
+    return gsbResult;
   }
-      
-  /// Perform any remaining requirement inference.
-  for (auto sourcePair : inferenceSources) {
-    auto *typeRepr = sourcePair.getTypeRepr();
-    auto source =
-      FloatingRequirementSource::forInferred(
-        typeRepr ? typeRepr->getStartLoc() : SourceLoc());
-
-    builder.inferRequirements(*parentModule,
-                              sourcePair.getType(),
-                              source);
   }
-  
-  // Finish by adding any remaining requirements.
-  auto source =
-    FloatingRequirementSource::forInferred(SourceLoc());
-      
-  for (const auto &req : addedRequirements)
-    builder.addRequirement(req, source, parentModule);
-  
-  return std::move(builder).computeGenericSignature(
-      allowConcreteGenericParams);
 }

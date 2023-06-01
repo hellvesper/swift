@@ -6,7 +6,7 @@ enum Either<T,U> {
 }
 
 @resultBuilder
-struct TupleBuilder { // expected-note 2 {{struct 'TupleBuilder' declared here}}
+struct TupleBuilder { // expected-note 3 {{struct 'TupleBuilder' declared here}}
   static func buildBlock() -> () { }
   
   static func buildBlock<T1>(_ t1: T1) -> T1 {
@@ -99,8 +99,23 @@ func testDiags() {
   tuplify(true) { _ in
     17
     let x = 17
-    let y: Int // expected-error{{closure containing a declaration cannot be used with result builder 'TupleBuilder'}}
+    let y: Int // expected-error{{local variable 'y' requires explicit initializer to be used with result builder 'TupleBuilder'}} {{15-15= = <#value#>}}
     x + 25
+  }
+
+  tuplify(true) { _ in
+    17
+    let y: Int, z: String
+    // expected-error@-1 {{local variable 'y' requires explicit initializer to be used with result builder 'TupleBuilder'}} {{15-15= = <#value#>}}
+    // expected-error@-2 {{local variable 'z' requires explicit initializer to be used with result builder 'TupleBuilder'}} {{26-26= = <#value#>}}
+    y + 25
+  }
+
+  tuplify(true) { _ in
+    0
+    let x: Int = 0, y: String = "" // Multiple initialized pattern bindings are okay
+    x + 1
+    y
   }
 
   // Statements unsupported by the particular builder.
@@ -652,7 +667,7 @@ struct MyView {
 
   @TupleBuilder var invalidSwitchMultiple: some P {
     switch Optional.some(1) {
-    case .none: // expected-error {{'case' label in a 'switch' should have at least one executable statement}}
+    case .none: // expected-error {{'case' label in a 'switch' must have at least one executable statement}}
     case . // expected-error {{expected ':' after 'case'}}
     } // expected-error {{expected identifier after '.' expression}}
   }
@@ -764,5 +779,50 @@ func test_rdar65667992() {
       default: S()
       }
     }
+  }
+}
+
+func test_weak_with_nonoptional_type() {
+  class X {
+    func test() -> Int { 0 }
+  }
+
+  tuplify(true) { c in
+    weak var x: X = X() // expected-error {{'weak' variable should have optional type 'X?'}}
+
+    if let x = x {
+      x.test()
+    }
+
+    42
+  }
+}
+
+// rdar://80941497 - compiler fails to produce diagnostic when referencing missing member in optional context
+func test_missing_member_in_optional_context() {
+  struct Test {
+  }
+
+  var test: Test? = nil
+
+  tuplify(true) { c in
+    if let prop = test?.prop { // expected-error {{value of type 'Test' has no member 'prop'}}
+      0
+    }
+
+    if let method = test?.method() { // expected-error {{value of type 'Test' has no member 'method'}}
+      1
+    }
+  }
+}
+
+func test_redeclations() {
+  tuplify(true) { c in
+    let foo = 0 // expected-note {{'foo' previously declared here}}
+    let foo = foo // expected-error {{invalid redeclaration of 'foo'}}
+  }
+
+  tuplify(true) { c in
+    let (foo, foo) = (5, 6) // expected-error {{invalid redeclaration of 'foo'}} expected-note {{'foo' previously declared here}}
   }
 }

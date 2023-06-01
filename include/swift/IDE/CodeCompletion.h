@@ -17,6 +17,7 @@
 #include "swift/Basic/Debug.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/OptionSet.h"
+#include "swift/Frontend/Frontend.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
@@ -132,35 +133,46 @@ public:
     Equal,
     Whitespace,
 
+    /// The first chunk of a whole generic parameter clause.
+    /// E.g '<T, C: Collection>'
+    GenericParameterClauseBegin,
+
+    /// The first chunk of a generic quirement clause.
+    /// E.g. 'where T: Collection, T.Element == Int'
+    GenericRequirementClauseBegin,
+
     /// The first chunk of a substring that describes the parameter for a
     /// generic type.
     GenericParameterBegin,
     /// Generic type parameter name.
     GenericParameterName,
 
-    /// The first chunk of a substring that describes the parameter for a
+    /// The first chunk of a substring that describes the argument for a
     /// function call.
-    CallParameterBegin,
-    /// Function call parameter name.
-    CallParameterName,
-    /// Function call parameter internal / local name.  If the parameter has no
-    /// formal API name, it can still have a local name which can be useful
-    /// for display purposes.
+    CallArgumentBegin,
+
+    /// Function call argument label.
+    CallArgumentName,
+
+    /// Function parameter internal / local name for an call argument. If the
+    /// parameter has no formal API name, it can still have a local name which
+    /// can be useful for display purposes.
     ///
     /// This chunk should not be inserted into the editor buffer.
-    CallParameterInternalName,
-    /// A colon between parameter name and value.  Should be inserted in the
-    /// editor buffer if the preceding CallParameterName was inserted.
-    CallParameterColon,
+    CallArgumentInternalName,
+
+    /// A colon between argument name and value.  Should be inserted in the
+    /// editor buffer if the preceding CallArgumentName was inserted.
+    CallArgumentColon,
 
     /// A colon between parameter name and value. Used in decl attribute.
     DeclAttrParamColon,
 
-    /// Required parameter type.
-    CallParameterType,
+    /// Required argument type.
+    CallArgumentType,
 
-    /// Parameter type tag for annotated results.
-    CallParameterTypeBegin,
+    /// Argument type tag for annotated results.
+    CallArgumentTypeBegin,
 
     /// System type name.
     TypeIdSystem,
@@ -168,15 +180,15 @@ public:
     /// Non-system type name.
     TypeIdUser,
 
-    /// Desugared closure parameter type. This can be used to get the
-    /// closure type if CallParameterType is a TypeAliasType.
-    CallParameterClosureType,
+    /// Desugared closure argument type. This can be used to get the
+    /// closure type if CallArgumentType is a TypeAliasType.
+    CallArgumentClosureType,
 
-    /// An expanded closure expression for the value of a parameter, including
+    /// An expanded closure expression for the value of an argument, including
     /// the left and right braces and possible signature. The preferred
     /// position to put the cursor after the completion result is inserted
     /// into the editor buffer is between the braces.
-    CallParameterClosureExpr,
+    CallArgumentClosureExpr,
 
     /// A placeholder for \c ! or \c ? in a call to a method found by dynamic
     /// lookup.
@@ -190,6 +202,30 @@ public:
     /// The default spelling is \c !, but clients may render it as \c ? if
     /// desired.
     OptionalMethodCallTail,
+
+    /// The first chunk of a substring that describes the single parameter
+    /// declaration for a parameter clause.
+    ParameterDeclBegin,
+
+    ParameterDeclExternalName,
+
+    ParameterDeclLocalName,
+
+    ParameterDeclColon,
+
+    ParameterDeclTypeBegin,
+
+    /// Default argument clause for parameter declarations.
+    DefaultArgumentClauseBegin,
+
+    /// First chunk for effect specifiers. i.e. 'async' and 'throws'.
+    EffectsSpecifierClauseBegin,
+
+    /// First chunk for result type clause i.e. ' -> ResultTy' or ': ResultTy'.
+    DeclResultTypeClauseBegin,
+
+    /// First chunk for attribute and modifier list i.e. 'override public'
+    AttributeAndModifierListBegin,
 
     /// Specifies the type of the whole entity that is returned in this code
     /// completion result.  For example, for variable references it is the
@@ -212,11 +248,19 @@ public:
   };
 
   static bool chunkStartsNestedGroup(ChunkKind Kind) {
-    return Kind == ChunkKind::CallParameterBegin ||
+    return Kind == ChunkKind::CallArgumentBegin ||
            Kind == ChunkKind::GenericParameterBegin ||
            Kind == ChunkKind::OptionalBegin ||
-           Kind == ChunkKind::CallParameterTypeBegin ||
-           Kind == ChunkKind::TypeAnnotationBegin;
+           Kind == ChunkKind::CallArgumentTypeBegin ||
+           Kind == ChunkKind::TypeAnnotationBegin ||
+           Kind == ChunkKind::ParameterDeclBegin ||
+           Kind == ChunkKind::ParameterDeclTypeBegin ||
+           Kind == ChunkKind::DefaultArgumentClauseBegin ||
+           Kind == ChunkKind::GenericParameterClauseBegin ||
+           Kind == ChunkKind::EffectsSpecifierClauseBegin ||
+           Kind == ChunkKind::DeclResultTypeClauseBegin ||
+           Kind == ChunkKind::GenericRequirementClauseBegin ||
+           Kind == ChunkKind::AttributeAndModifierListBegin;
   }
 
   static bool chunkHasText(ChunkKind Kind) {
@@ -243,14 +287,17 @@ public:
            Kind == ChunkKind::Ampersand ||
            Kind == ChunkKind::Equal ||
            Kind == ChunkKind::Whitespace ||
-           Kind == ChunkKind::CallParameterName ||
-           Kind == ChunkKind::CallParameterInternalName ||
-           Kind == ChunkKind::CallParameterColon ||
+           Kind == ChunkKind::CallArgumentName ||
+           Kind == ChunkKind::CallArgumentInternalName ||
+           Kind == ChunkKind::CallArgumentColon ||
+           Kind == ChunkKind::CallArgumentType ||
+           Kind == ChunkKind::CallArgumentClosureType ||
+           Kind == ChunkKind::CallArgumentClosureExpr ||
+           Kind == ChunkKind::ParameterDeclExternalName ||
+           Kind == ChunkKind::ParameterDeclLocalName ||
+           Kind == ChunkKind::ParameterDeclColon ||
            Kind == ChunkKind::DeclAttrParamColon ||
            Kind == ChunkKind::DeclAttrParamKeyword ||
-           Kind == ChunkKind::CallParameterType ||
-           Kind == ChunkKind::CallParameterClosureType ||
-           Kind == ChunkKind::CallParameterClosureExpr ||
            Kind == ChunkKind::GenericParameterName ||
            Kind == ChunkKind::DynamicLookupMethodCallTail ||
            Kind == ChunkKind::OptionalMethodCallTail ||
@@ -361,9 +408,6 @@ public:
   StringRef getFirstTextChunk(bool includeLeadingPunctuation = false) const;
   Optional<unsigned>
   getFirstTextChunkIndex(bool includeLeadingPunctuation = false) const;
-
-  /// Concatenates all text chunks considered part of the name to \p OS.
-  void getName(raw_ostream &OS) const;
 
   /// Print a debug representation of the code completion string to \p OS.
   void print(raw_ostream &OS) const;
@@ -568,12 +612,20 @@ enum class CompletionKind {
   TypeAttrBeginning,
 };
 
+enum class CodeCompletionDiagnosticSeverity: uint8_t {
+  None,
+  Error,
+  Warning,
+  Remark,
+  Note,
+};
+
 /// A single code completion result.
 class CodeCompletionResult {
   friend class CodeCompletionResultBuilder;
 
 public:
-  enum ResultKind {
+  enum class ResultKind {
     Declaration,
     Keyword,
     Pattern,
@@ -583,7 +635,7 @@ public:
 
   /// Describes the relationship between the type of the completion results and
   /// the expected type at the code completion position.
-  enum ExpectedTypeRelation {
+  enum class ExpectedTypeRelation {
     /// The result does not have a type (e.g. keyword).
     NotApplicable,
 
@@ -607,7 +659,9 @@ public:
   enum class NotRecommendedReason {
     None = 0,
     RedundantImport,
+    RedundantImportIndirect,
     Deprecated,
+    SoftDeprecated,
     InvalidAsyncContext,
     CrossActorReference,
     VariableUsedInOwnDefinition,
@@ -635,8 +689,9 @@ private:
   StringRef ModuleName;
   StringRef BriefDocComment;
   ArrayRef<StringRef> AssociatedUSRs;
-  ArrayRef<std::pair<StringRef, StringRef>> DocWords;
   unsigned TypeDistance : 3;
+  unsigned DiagnosticSeverity: 3;
+  StringRef DiagnosticMessage;
 
 public:
   /// Constructs a \c Pattern, \c Keyword or \c BuiltinOperator result.
@@ -649,12 +704,13 @@ public:
                        CodeCompletionOperatorKind KnownOperatorKind =
                            CodeCompletionOperatorKind::None,
                        StringRef BriefDocComment = StringRef())
-      : Kind(Kind), KnownOperatorKind(unsigned(KnownOperatorKind)),
-        SemanticContext(unsigned(SemanticContext)), Flair(unsigned(Flair.toRaw())),
+      : Kind(unsigned(Kind)), KnownOperatorKind(unsigned(KnownOperatorKind)),
+        SemanticContext(unsigned(SemanticContext)),
+        Flair(unsigned(Flair.toRaw())),
         NotRecommended(unsigned(NotRecommendedReason::None)),
         NumBytesToErase(NumBytesToErase), CompletionString(CompletionString),
-        BriefDocComment(BriefDocComment), TypeDistance(TypeDistance) {
-    assert(Kind != Declaration && "use the other constructor");
+        BriefDocComment(BriefDocComment), TypeDistance(unsigned(TypeDistance)) {
+    assert(Kind != ResultKind::Declaration && "use the other constructor");
     assert(CompletionString);
     if (isOperator() && KnownOperatorKind == CodeCompletionOperatorKind::None)
       this->KnownOperatorKind =
@@ -663,6 +719,7 @@ public:
            getOperatorKind() != CodeCompletionOperatorKind::None);
     AssociatedKind = 0;
     IsSystem = 0;
+    DiagnosticSeverity = 0;
   }
 
   /// Constructs a \c Keyword result.
@@ -670,19 +727,20 @@ public:
   /// \note The caller must ensure \c CodeCompletionString outlives this result.
   CodeCompletionResult(CodeCompletionKeywordKind Kind,
                        SemanticContextKind SemanticContext,
-                       CodeCompletionFlair Flair,
-                       unsigned NumBytesToErase,
+                       CodeCompletionFlair Flair, unsigned NumBytesToErase,
                        CodeCompletionString *CompletionString,
                        ExpectedTypeRelation TypeDistance,
                        StringRef BriefDocComment = StringRef())
-      : Kind(Keyword), KnownOperatorKind(0),
-        SemanticContext(unsigned(SemanticContext)), Flair(unsigned(Flair.toRaw())),
+      : Kind(unsigned(ResultKind::Keyword)), KnownOperatorKind(0),
+        SemanticContext(unsigned(SemanticContext)),
+        Flair(unsigned(Flair.toRaw())),
         NotRecommended(unsigned(NotRecommendedReason::None)),
         NumBytesToErase(NumBytesToErase), CompletionString(CompletionString),
-        BriefDocComment(BriefDocComment), TypeDistance(TypeDistance) {
+        BriefDocComment(BriefDocComment), TypeDistance(unsigned(TypeDistance)) {
     assert(CompletionString);
     AssociatedKind = static_cast<unsigned>(Kind);
     IsSystem = 0;
+    DiagnosticSeverity = 0;
   }
 
   /// Constructs a \c Literal result.
@@ -693,13 +751,15 @@ public:
                        CodeCompletionFlair Flair, unsigned NumBytesToErase,
                        CodeCompletionString *CompletionString,
                        ExpectedTypeRelation TypeDistance)
-      : Kind(Literal), KnownOperatorKind(0),
-        SemanticContext(unsigned(SemanticContext)), Flair(unsigned(Flair.toRaw())),
+      : Kind(unsigned(ResultKind::Literal)), KnownOperatorKind(0),
+        SemanticContext(unsigned(SemanticContext)),
+        Flair(unsigned(Flair.toRaw())),
         NotRecommended(unsigned(NotRecommendedReason::None)),
         NumBytesToErase(NumBytesToErase), CompletionString(CompletionString),
-        TypeDistance(TypeDistance) {
+        TypeDistance(unsigned(TypeDistance)) {
     AssociatedKind = static_cast<unsigned>(LiteralKind);
     IsSystem = 0;
+    DiagnosticSeverity = 0;
     assert(CompletionString);
   }
 
@@ -715,18 +775,17 @@ public:
                        CodeCompletionResult::NotRecommendedReason NotRecReason,
                        StringRef BriefDocComment,
                        ArrayRef<StringRef> AssociatedUSRs,
-                       ArrayRef<std::pair<StringRef, StringRef>> DocWords,
-                       enum ExpectedTypeRelation TypeDistance)
-      : Kind(ResultKind::Declaration), KnownOperatorKind(0),
-        SemanticContext(unsigned(SemanticContext)), Flair(unsigned(Flair.toRaw())),
-        NotRecommended(unsigned(NotRecReason)),
+                       ExpectedTypeRelation TypeDistance)
+      : Kind(unsigned(ResultKind::Declaration)), KnownOperatorKind(0),
+        SemanticContext(unsigned(SemanticContext)),
+        Flair(unsigned(Flair.toRaw())), NotRecommended(unsigned(NotRecReason)),
         NumBytesToErase(NumBytesToErase), CompletionString(CompletionString),
         ModuleName(ModuleName), BriefDocComment(BriefDocComment),
-        AssociatedUSRs(AssociatedUSRs), DocWords(DocWords),
-        TypeDistance(TypeDistance) {
+        AssociatedUSRs(AssociatedUSRs), TypeDistance(unsigned(TypeDistance)) {
     assert(AssociatedDecl && "should have a decl");
     AssociatedKind = unsigned(getCodeCompletionDeclKind(AssociatedDecl));
     IsSystem = getDeclIsSystem(AssociatedDecl);
+    DiagnosticSeverity = 0;
     assert(CompletionString);
     if (isOperator())
       KnownOperatorKind =
@@ -742,19 +801,21 @@ public:
                        CodeCompletionDeclKind DeclKind, bool IsSystem,
                        StringRef ModuleName,
                        CodeCompletionResult::NotRecommendedReason NotRecReason,
-                       StringRef BriefDocComment,
+                       CodeCompletionDiagnosticSeverity diagSeverity,
+                       StringRef DiagnosticMessage, StringRef BriefDocComment,
                        ArrayRef<StringRef> AssociatedUSRs,
-                       ArrayRef<std::pair<StringRef, StringRef>> DocWords,
                        ExpectedTypeRelation TypeDistance,
                        CodeCompletionOperatorKind KnownOperatorKind)
-      : Kind(ResultKind::Declaration),
+      : Kind(unsigned(ResultKind::Declaration)),
         KnownOperatorKind(unsigned(KnownOperatorKind)),
-        SemanticContext(unsigned(SemanticContext)), Flair(unsigned(Flair.toRaw())),
-        NotRecommended(unsigned(NotRecReason)), IsSystem(IsSystem),
-        NumBytesToErase(NumBytesToErase), CompletionString(CompletionString),
-        ModuleName(ModuleName), BriefDocComment(BriefDocComment),
-        AssociatedUSRs(AssociatedUSRs), DocWords(DocWords),
-        TypeDistance(TypeDistance) {
+        SemanticContext(unsigned(SemanticContext)),
+        Flair(unsigned(Flair.toRaw())), NotRecommended(unsigned(NotRecReason)),
+        IsSystem(IsSystem), NumBytesToErase(NumBytesToErase),
+        CompletionString(CompletionString), ModuleName(ModuleName),
+        BriefDocComment(BriefDocComment), AssociatedUSRs(AssociatedUSRs),
+        TypeDistance(unsigned(TypeDistance)),
+        DiagnosticSeverity(unsigned(diagSeverity)),
+        DiagnosticMessage(DiagnosticMessage) {
     AssociatedKind = static_cast<unsigned>(DeclKind);
     assert(CompletionString);
     assert(!isOperator() ||
@@ -770,23 +831,23 @@ public:
   ResultKind getKind() const { return static_cast<ResultKind>(Kind); }
 
   CodeCompletionDeclKind getAssociatedDeclKind() const {
-    assert(getKind() == Declaration);
+    assert(getKind() == ResultKind::Declaration);
     return static_cast<CodeCompletionDeclKind>(AssociatedKind);
   }
 
   CodeCompletionLiteralKind getLiteralKind() const {
-    assert(getKind() == Literal);
+    assert(getKind() == ResultKind::Literal);
     return static_cast<CodeCompletionLiteralKind>(AssociatedKind);
   }
 
   CodeCompletionKeywordKind getKeywordKind() const {
-    assert(getKind() == Keyword);
+    assert(getKind() == ResultKind::Keyword);
     return static_cast<CodeCompletionKeywordKind>(AssociatedKind);
   }
 
   bool isOperator() const {
-    if (getKind() != Declaration)
-      return getKind() == BuiltinOperator;
+    if (getKind() != ResultKind::Declaration)
+      return getKind() == ResultKind::BuiltinOperator;
     switch (getAssociatedDeclKind()) {
     case CodeCompletionDeclKind::PrefixOperatorFunction:
     case CodeCompletionDeclKind::PostfixOperatorFunction:
@@ -849,8 +910,17 @@ public:
     return AssociatedUSRs;
   }
 
-  ArrayRef<std::pair<StringRef, StringRef>> getDeclKeywords() const {
-    return DocWords;
+  void setDiagnostics(CodeCompletionDiagnosticSeverity severity, StringRef message) {
+    DiagnosticSeverity = static_cast<unsigned>(severity);
+    DiagnosticMessage = message;
+  }
+
+  CodeCompletionDiagnosticSeverity getDiagnosticSeverity() const {
+    return static_cast<CodeCompletionDiagnosticSeverity>(DiagnosticSeverity);
+  }
+
+  StringRef getDiagnosticMessage() const {
+    return DiagnosticMessage;
   }
 
   /// Print a debug representation of the code completion result to \p OS.
@@ -880,6 +950,13 @@ struct CodeCompletionResultSink {
 
   /// Whether to emit object literals if desired.
   bool includeObjectLiterals = true;
+
+  /// Whether to emit type initializers in addition to type names in expression
+  /// position.
+  bool addInitsToTopLevel = false;
+
+  /// Whether to perform "call pettern heuristics".
+  bool enableCallPatternHeuristics = false;
 
   std::vector<CodeCompletionResult *> Results;
 
@@ -950,12 +1027,28 @@ public:
       : Cache(Cache) {}
 
   void setAnnotateResult(bool flag) { CurrentResults.annotateResult = flag; }
-  bool getAnnotateResult() { return CurrentResults.annotateResult; }
+  bool getAnnotateResult() const { return CurrentResults.annotateResult; }
 
   void setIncludeObjectLiterals(bool flag) {
     CurrentResults.includeObjectLiterals = flag;
   }
-  bool includeObjectLiterals() { return CurrentResults.includeObjectLiterals; }
+  bool includeObjectLiterals() const {
+    return CurrentResults.includeObjectLiterals;
+  }
+
+  void setAddInitsToTopLevel(bool flag) {
+    CurrentResults.addInitsToTopLevel = flag;
+  }
+  bool getAddInitsToTopLevel() const {
+    return CurrentResults.addInitsToTopLevel;
+  }
+
+  void setCallPatternHeuristics(bool flag) {
+    CurrentResults.enableCallPatternHeuristics = flag;
+  }
+  bool getCallPatternHeuristics() const {
+    return CurrentResults.enableCallPatternHeuristics;
+  }
 
   /// Allocate a string owned by the code completion context.
   StringRef copyString(StringRef Str);
@@ -971,6 +1064,12 @@ public:
   CodeCompletionResultSink &getResultSink() {
     return CurrentResults;
   }
+};
+
+struct SwiftCompletionInfo {
+  swift::ASTContext *swiftASTContext = nullptr;
+  const swift::CompilerInvocation *invocation = nullptr;
+  CodeCompletionContext *completionContext = nullptr;
 };
 
 /// An abstract base class for consumers of code completion results.
@@ -995,30 +1094,7 @@ struct SimpleCachingCodeCompletionConsumer : public CodeCompletionConsumer {
                                DeclContext *DCForModules) override;
 
   /// Clients should override this method to receive \p Results.
-  virtual void handleResults(
-      MutableArrayRef<CodeCompletionResult *> Results) = 0;
-};
-
-/// A code completion result consumer that prints the results to a
-/// \c raw_ostream.
-class PrintingCodeCompletionConsumer
-    : public SimpleCachingCodeCompletionConsumer {
-  llvm::raw_ostream &OS;
-  bool IncludeKeywords;
-  bool IncludeComments;
-  bool PrintAnnotatedDescription;
-
-public:
- PrintingCodeCompletionConsumer(llvm::raw_ostream &OS,
-                                bool IncludeKeywords = true,
-                                bool IncludeComments = true,
-                                bool PrintAnnotatedDescription = false)
-     : OS(OS),
-       IncludeKeywords(IncludeKeywords),
-       IncludeComments(IncludeComments),
-       PrintAnnotatedDescription(PrintAnnotatedDescription) {}
-
- void handleResults(MutableArrayRef<CodeCompletionResult *> Results) override;
+  virtual void handleResults(CodeCompletionContext &context) = 0;
 };
 
 /// Create a factory for code completion callbacks.

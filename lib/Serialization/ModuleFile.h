@@ -333,7 +333,7 @@ public:
 
   /// Emits one last diagnostic, adds the current module details and errors to
   /// the pretty stack trace, and then aborts.
-  LLVM_ATTRIBUTE_NORETURN void fatal(llvm::Error error) const;
+  [[noreturn]] void fatal(llvm::Error error) const;
   void fatalIfNotSuccess(llvm::Error error) const {
     if (error)
       fatal(std::move(error));
@@ -344,9 +344,12 @@ public:
     fatal(expected.takeError());
   }
 
-  LLVM_ATTRIBUTE_NORETURN void fatal() const {
+  /// Report an unexpected format error that could happen only from a memory-level
+  /// inconsistency. Please prefer passing an error to `fatal(llvm::Error error)` when possible.
+  [[noreturn]] void fatal() const {
     fatal(llvm::make_error<llvm::StringError>(
-        "(see \"While...\" info below)", llvm::inconvertibleErrorCode()));
+        "Memory corruption or serialization format inconsistency.",
+        llvm::inconvertibleErrorCode()));
   }
 
   /// Outputs information useful for diagnostics to \p out
@@ -388,6 +391,10 @@ private:
   llvm::Error
   readGenericRequirementsChecked(SmallVectorImpl<Requirement> &requirements,
                                  llvm::BitstreamCursor &Cursor);
+
+  /// Read a list of associated type declarations in a protocol.
+  void readAssociatedTypes(SmallVectorImpl<AssociatedTypeDecl *> &assocTypes,
+                           llvm::BitstreamCursor &Cursor);
 
   /// Populates the protocol's default witness table.
   ///
@@ -467,6 +474,11 @@ public:
     return Core->Bits.IsStaticLibrary;
   }
 
+  /// Whether this module was built with -experimental-hermetic-seal-at-link.
+  bool hasHermeticSealAtLink() const {
+    return Core->Bits.HasHermeticSealAtLink;
+  }
+
   /// Whether the module is resilient. ('-enable-library-evolution')
   ResilienceStrategy getResilienceStrategy() const {
     return ResilienceStrategy(Core->Bits.ResilienceStrategy);
@@ -496,6 +508,9 @@ public:
   /// \c true if this module has information from a corresponding
   /// .swiftsourceinfo file (ie. the file exists and has been read).
   bool hasSourceInfo() const { return Core->hasSourceInfo(); }
+
+  /// \c true if this module was built with complete checking for concurrency.
+  bool isConcurrencyChecked() const { return Core->isConcurrencyChecked(); }
 
   /// Associates this module file with the AST node representing it.
   ///
@@ -657,7 +672,7 @@ public:
   /// This includes all decls that should be displayed to clients of the module.
   /// This can differ from \c getTopLevelDecls, e.g. it returns decls from a
   /// shadowed clang module.
-  void getDisplayDecls(SmallVectorImpl<Decl*> &results);
+  void getDisplayDecls(SmallVectorImpl<Decl*> &results, bool recursive = false);
 
   StringRef getModuleFilename() const {
     if (!Core->ModuleInterfacePath.empty())
@@ -709,6 +724,10 @@ public:
   loadRequirementSignature(const ProtocolDecl *proto, uint64_t contextData,
                            SmallVectorImpl<Requirement> &requirements) override;
 
+  void
+  loadAssociatedTypes(const ProtocolDecl *proto, uint64_t contextData,
+                      SmallVectorImpl<AssociatedTypeDecl *> &assocTypes) override;
+
   Optional<StringRef> getGroupNameById(unsigned Id) const;
   Optional<StringRef> getSourceFileNameById(unsigned Id) const;
   Optional<StringRef> getGroupNameForDecl(const Decl *D) const;
@@ -724,7 +743,8 @@ public:
   Optional<Fingerprint> loadFingerprint(const IterableDeclContext *IDC) const;
   void collectBasicSourceFileInfo(
       llvm::function_ref<void(const BasicSourceFileInfo &)> callback) const;
-
+  void collectSerializedSearchPath(
+      llvm::function_ref<void(StringRef)> callback) const;
 
   // MARK: Deserialization interface
 

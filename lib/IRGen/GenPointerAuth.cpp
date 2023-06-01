@@ -441,6 +441,10 @@ static void hashStringForType(IRGenModule &IGM, CanType Ty, raw_ostream &Out,
       hashStringForType(IGM, UnwrappedTy->getCanonicalType(), Out, genericEnv);
       Out << ">";
     }
+  } else if (auto ETy = dyn_cast<ExistentialType>(Ty)) {
+    // Look through existential types
+    hashStringForType(IGM, ETy->getConstraintType()->getCanonicalType(),
+                      Out, genericEnv);
   } else if (auto GTy = dyn_cast<AnyGenericType>(Ty)) {
     // For generic and non-generic value types, use the mangled declaration
     // name, and ignore all generic arguments.
@@ -523,8 +527,7 @@ static uint64_t getTypeHash(IRGenModule &IGM, CanSILFunctionType type) {
   auto genericSig = type->getInvocationGenericSignature();
   hashStringForFunctionType(
       IGM, type, Out,
-      genericSig ? genericSig->getCanonicalSignature()->getGenericEnvironment()
-                 : nullptr);
+      genericSig.getCanonicalSignature().getGenericEnvironment());
   return clang::CodeGen::computeStableStringHash(Out.str());
 }
 
@@ -532,9 +535,7 @@ static uint64_t getYieldTypesHash(IRGenModule &IGM, CanSILFunctionType type) {
   SmallString<32> buffer;
   llvm::raw_svector_ostream out(buffer);
   auto genericSig = type->getInvocationGenericSignature();
-  GenericEnvironment *genericEnv =
-      genericSig ? genericSig->getCanonicalSignature()->getGenericEnvironment()
-                 : nullptr;
+  auto *genericEnv =  genericSig.getCanonicalSignature().getGenericEnvironment();
 
   out << [&]() -> StringRef {
     switch (type->getCoroutineKind()) {

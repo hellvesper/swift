@@ -2,13 +2,15 @@ set(SWIFT_GYB_FLAGS
     "-DCFDatabaseFile=${SWIFT_SOURCE_DIR}/lib/ClangImporter/CFDatabase.def")
 
 add_gyb_target(generated_sorted_cf_database
-    SortedCFDatabase.def.gyb)
+    SortedCFDatabase.def.gyb
+    DEPENDS "${SWIFT_SOURCE_DIR}/lib/ClangImporter/CFDatabase.def")
 
 add_swift_host_library(swiftClangImporter STATIC
   CFTypeInfo.cpp
   ClangAdapter.cpp
   ClangDiagnosticConsumer.cpp
   ClangImporter.cpp
+  ClangImporterRequests.cpp
   ClangModuleDependencyScanner.cpp
   ClangSourceBufferImporter.cpp
   DWARFImporter.cpp

@@ -81,7 +81,8 @@ public:
   /// \param conditionalRequirements An out parameter initialized to an
   /// array of requirements that the caller must check to ensure this
   /// requirement is completely satisfied.
-  bool isSatisfied(ArrayRef<Requirement> &conditionalRequirements) const;
+  bool isSatisfied(ArrayRef<Requirement> &conditionalRequirements,
+                   bool allowMissing = false) const;
 
   /// Determines if this substituted requirement can ever be satisfied,
   /// possibly with additional substitutions.
@@ -90,6 +91,9 @@ public:
   /// 'T : C' can be satisfied; however, if 'T' already has an unrelated
   /// superclass requirement, 'T : C' cannot be satisfied.
   bool canBeSatisfied() const;
+
+  /// Linear order on requirements in a generic signature.
+  int compare(const Requirement &other) const;
 
   SWIFT_DEBUG_DUMP;
   void dump(raw_ostream &out) const;
@@ -100,6 +104,25 @@ public:
 inline void simple_display(llvm::raw_ostream &out, const Requirement &req) {
   req.print(out, PrintOptions());
 }
+
+/// A requirement as written in source, together with a source location. See
+/// ProtocolDecl::getStructuralRequirements().
+struct StructuralRequirement {
+  /// The actual requirement, where the types were resolved with the
+  /// 'Structural' type resolution stage.
+  Requirement req;
+
+  /// The source location where the requirement is written, used for redundancy
+  /// and conflict diagnostics.
+  SourceLoc loc;
+
+  /// A flag indicating whether the requirement was inferred from the
+  /// application of a type constructor. Also used for diagnostics, because
+  /// an inferred requirement made redundant by an explicit requirement is not
+  /// diagnosed as redundant, since we want to give users the option of
+  /// spelling out these requirements explicitly.
+  bool inferred = false;
+};
 
 } // end namespace swift
 

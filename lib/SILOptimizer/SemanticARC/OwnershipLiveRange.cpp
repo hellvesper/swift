@@ -14,6 +14,7 @@
 #include "OwnershipPhiOperand.h"
 
 #include "swift/SIL/BasicBlockUtils.h"
+#include "swift/SIL/OwnershipUtils.h"
 
 using namespace swift;
 using namespace swift::semanticarc;
@@ -83,6 +84,20 @@ OwnershipLiveRange::OwnershipLiveRange(SILValue value)
       continue;
     }
 
+    // If we have a subclass of OwnershipForwardingMixin that doesnt directly
+    // forward its operand to the result, treat the use as an unknown consuming
+    // use.
+    //
+    // If we do not directly forward and we have an owned value (which we do
+    // here), we could get back a different value. Thus we can not transform
+    // such a thing from owned to guaranteed.
+    if (auto *i = OwnershipForwardingMixin::get(op->getUser())) {
+      if (!i->isDirectlyForwarding()) {
+        tmpUnknownConsumingUses.push_back(op);
+        continue;
+      }
+    }
+
     // Ok, this is a forwarding instruction whose ownership we can flip from
     // owned -> guaranteed.
     tmpForwardingConsumingUses.push_back(op);
@@ -109,9 +124,14 @@ OwnershipLiveRange::OwnershipLiveRange(SILValue value)
         continue;
 
       for (auto *succArg : succBlock->getSILPhiArguments()) {
-        // If we have an any value, just continue.
-        if (succArg->getOwnershipKind() == OwnershipKind::None)
+        // Owned values can get transformed to None values, currently we bail
+        // out computing OwnershipLiveRange in this case, because it can lead to
+        // incorrect results in the presence of dead edges on the non-trivial
+        // paths of switch_enum.
+        if (succArg->getOwnershipKind() == OwnershipKind::None) {
+          tmpUnknownConsumingUses.push_back(op);
           continue;
+        }
 
         // Otherwise add all users of this BBArg to the worklist to visit
         // recursively.

@@ -1441,6 +1441,9 @@ static const TypeInfo *createExistentialTypeInfo(IRGenModule &IGM, CanType T) {
   }
 
   // Note: Protocol composition types are not nominal, but we name them anyway.
+  if (auto existential = T->getAs<ExistentialType>()) {
+    T = existential->getConstraintType()->getCanonicalType();
+  }
   llvm::StructType *type;
   if (isa<ProtocolType>(T))
     type = IGM.createNominalType(T);
@@ -1550,6 +1553,11 @@ const TypeInfo *TypeConverter::convertProtocolType(ProtocolType *T) {
 
 const TypeInfo *
 TypeConverter::convertProtocolCompositionType(ProtocolCompositionType *T) {
+  return createExistentialTypeInfo(IGM, CanType(T));
+}
+
+const TypeInfo *
+TypeConverter::convertExistentialType(ExistentialType *T) {
   return createExistentialTypeInfo(IGM, CanType(T));
 }
 
@@ -1778,6 +1786,16 @@ void irgen::emitClassExistentialContainer(IRGenFunction &IGF,
   });
 }
 
+#ifndef NDEBUG
+static size_t numProtocolsWithWitnessTables(
+    ArrayRef<ProtocolConformanceRef> conformances) {
+  return llvm::count_if(conformances, [](ProtocolConformanceRef conformance) {
+    auto proto = conformance.getRequirement();
+    return Lowering::TypeConverter::protocolRequiresWitnessTable(proto);
+  });
+}
+#endif
+
 /// Emit an existential container initialization operation for a concrete type.
 /// Returns the address of the uninitialized fixed-size buffer for the concrete
 /// value.
@@ -1791,7 +1809,8 @@ Address irgen::emitOpaqueExistentialContainerInit(IRGenFunction &IGF,
          "initializing a class existential container as opaque");
   auto &destTI = IGF.getTypeInfo(destType).as<OpaqueExistentialTypeInfo>();
   OpaqueExistentialLayout destLayout = destTI.getLayout();
-  assert(destTI.getStoredProtocols().size() == conformances.size());
+  assert(destTI.getStoredProtocols().size()
+             == numProtocolsWithWitnessTables(conformances));
 
   // First, write out the metadata.
   llvm::Value *metadata = IGF.emitTypeMetadataRef(formalSrcType);

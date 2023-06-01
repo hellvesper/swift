@@ -112,12 +112,10 @@ PolymorphicEffectKindRequest::evaluate(Evaluator &evaluator,
     return PolymorphicEffectKind::Always;
   }
 
-  if (auto genericSig = decl->getGenericSignature()) {
-    for (auto req : genericSig->getRequirements()) {
-      if (req.getKind() == RequirementKind::Conformance) {
-        if (req.getProtocolDecl()->hasPolymorphicEffect(kind)) {
-          return PolymorphicEffectKind::ByConformance;
-        }
+  for (auto req : decl->getGenericSignature().getRequirements()) {
+    if (req.getKind() == RequirementKind::Conformance) {
+      if (req.getProtocolDecl()->hasPolymorphicEffect(kind)) {
+        return PolymorphicEffectKind::ByConformance;
       }
     }
   }
@@ -328,17 +326,7 @@ public:
     return Substitutions;
   }
 
-  static AbstractFunction decomposeApply(ApplyExpr *apply,
-                                         SmallVectorImpl<Expr *> &args) {
-    auto *argExpr = apply->getArg();
-    if (auto *tupleExpr = dyn_cast<TupleExpr>(argExpr)) {
-      auto elts = tupleExpr->getElements();
-      args.append(elts.begin(), elts.end());
-    } else {
-      auto *parenExpr = cast<ParenExpr>(argExpr);
-      args.push_back(parenExpr->getSubExpr());
-    }
-
+  static AbstractFunction getAppliedFn(ApplyExpr *apply) {
     Expr *fn = apply->getFn()->getValueProvidingExpr();
 
     if (auto *selfCall = dyn_cast<SelfApplyExpr>(fn))
@@ -758,7 +746,7 @@ public:
   /// Check to see if the given function application throws or is async.
   Classification classifyApply(ApplyExpr *E) {
     if (isa<SelfApplyExpr>(E)) {
-      assert(!E->implicitlyAsync());
+      assert(!E->isImplicitlyAsync());
       return Classification();
     }
 
@@ -776,17 +764,18 @@ public:
     if (!fnType->isThrowing() &&
         !E->implicitlyThrows() &&
         !fnType->isAsync() &&
-        !E->implicitlyAsync()) {
+        !E->isImplicitlyAsync()) {
       return Classification();
     }
 
     // Decompose the application.
-    SmallVector<Expr *, 2> args;
-    auto fnRef = AbstractFunction::decomposeApply(E, args);
+    auto *args = E->getArgs();
+    auto fnRef = AbstractFunction::getAppliedFn(E);
 
     // If any of the arguments didn't type check, fail.
-    for (auto *arg : args) {
-      if (!arg->getType() || arg->getType()->hasError())
+    for (auto arg : *args) {
+      auto *argExpr = arg.getExpr();
+      if (!argExpr->getType() || argExpr->getType()->hasError())
         return Classification::forInvalidCode();
     }
 
@@ -794,7 +783,7 @@ public:
 
     auto classifyApplyEffect = [&](EffectKind kind) {
       if (!fnType->hasEffect(kind) &&
-          !(kind == EffectKind::Async && E->implicitlyAsync()) &&
+          !(kind == EffectKind::Async && E->isImplicitlyAsync()) &&
           !(kind == EffectKind::Throws && E->implicitlyThrows())) {
         return;
       }
@@ -824,13 +813,13 @@ public:
 
         // Use the most significant result from the arguments.
         auto params = origType->getParams();
-        if (params.size() != args.size()) {
+        if (params.size() != args->size()) {
           result.merge(Classification::forInvalidCode());
           return;
         }
 
         for (unsigned i = 0, e = params.size(); i < e; ++i) {
-          result.merge(classifyArgument(args[i],
+          result.merge(classifyArgument(args->getExpr(i),
                                         params[i].getParameterType(),
                                         kind));
         }
@@ -2112,12 +2101,11 @@ class CheckEffectsCoverage : public EffectsHandlingWalker<CheckEffectsCoverage> 
       assert(parent == nullptr && "Expected to be at top of expression");
       assert(isa<CallExpr>(lastParent) &&
              "Expected top of string interpolation to be CalExpr");
-      assert(isa<ParenExpr>(dyn_cast<CallExpr>(lastParent)->getArg()) &&
-             "Expected paren expr in string interpolation call");
-      if (CallExpr *callExpr = dyn_cast<CallExpr>(lastParent)) {
-        if (ParenExpr *body = dyn_cast<ParenExpr>(callExpr->getArg())) {
-          return body->getSubExpr();
-        }
+      assert(cast<CallExpr>(lastParent)->getArgs()->isUnlabeledUnary() &&
+             "Expected unary arg in string interpolation call");
+      if (auto *callExpr = dyn_cast<CallExpr>(lastParent)) {
+        if (auto *unaryArg = callExpr->getArgs()->getUnlabeledUnaryExpr())
+          return unaryArg;
       }
     }
 
@@ -2870,12 +2858,18 @@ private:
          }
 
          auto *call = dyn_cast<ApplyExpr>(&diag.expr);
-         if (call && call->implicitlyAsync()) {
+         if (call && call->isImplicitlyAsync()) {
            // Emit a tailored note if the call is implicitly async, meaning the
            // callee is isolated to an actor.
            auto callee = call->getCalledValue();
-           Ctx.Diags.diagnose(diag.expr.getStartLoc(), diag::actor_isolated_sync_func,
-                              callee->getDescriptiveKind(), callee->getName());
+           if (callee) {
+             Ctx.Diags.diagnose(diag.expr.getStartLoc(), diag::actor_isolated_sync_func,
+                                callee->getDescriptiveKind(), callee->getName());
+           } else {
+             Ctx.Diags.diagnose(
+                 diag.expr.getStartLoc(), diag::actor_isolated_sync_func_value,
+                 call->getFn()->getType());
+           }
          } else {
            Ctx.Diags.diagnose(diag.expr.getStartLoc(),
                               diag::async_access_without_await, 0);

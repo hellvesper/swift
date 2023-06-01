@@ -1,4 +1,4 @@
-// RUN: %target-run-simple-swift(-Xfrontend -enable-experimental-distributed -parse-as-library) | %FileCheck %s
+// RUN: %target-run-simple-swift(-Xfrontend -disable-availability-checking -Xfrontend -enable-experimental-distributed -parse-as-library) | %FileCheck %s
 
 // REQUIRES: executable_test
 // REQUIRES: concurrency
@@ -8,15 +8,17 @@
 // UNSUPPORTED: use_os_stdlib
 // UNSUPPORTED: back_deployment_runtime
 
-// REQUIRES: radar78290608
-
 import _Distributed
 
-@available(SwiftStdlib 5.5, *)
+@available(SwiftStdlib 5.6, *)
 distributed actor SomeSpecificDistributedActor {
 
   distributed func hello() async throws {
-     print("hello from \(self.actorAddress)")
+     print("hello from \(self.id)")
+  }
+
+  distributed func echo(int: Int) async throws -> Int {
+    int
   }
 }
 
@@ -31,47 +33,61 @@ func __isLocalActor(_ actor: AnyObject) -> Bool {
 
 // ==== Fake Transport ---------------------------------------------------------
 
-@available(SwiftStdlib 5.5, *)
-struct FakeTransport: ActorTransport {
-  func resolve<Act>(address: ActorAddress, as actorType: Act.Type)
-    throws -> ActorResolved<Act> where Act: DistributedActor {
-    fatalError()
+@available(SwiftStdlib 5.6, *)
+struct ActorAddress: ActorIdentity {
+  let address: String
+  init(parse address : String) {
+    self.address = address
   }
-  func assignAddress<Act>(
-    _ actorType: Act.Type
-  ) -> ActorAddress where Act : DistributedActor {
-    ActorAddress(parse: "")
-  }
-
-  public func actorReady<Act>(
-    _ actor: Act
-  ) where Act: DistributedActor {}
-
-  public func resignAddress(
-    _ address: ActorAddress
-  ) {}
 }
+
+@available(SwiftStdlib 5.6, *)
+struct FakeTransport: ActorTransport {
+  func decodeIdentity(from decoder: Decoder) throws -> AnyActorIdentity {
+    fatalError("not implemented \(#function)")
+  }
+
+  func resolve<Act>(_ identity: AnyActorIdentity, as actorType: Act.Type) throws -> Act?
+      where Act: DistributedActor {
+    return nil
+  }
+
+  func assignIdentity<Act>(_ actorType: Act.Type) -> AnyActorIdentity
+      where Act: DistributedActor {
+    .init(ActorAddress(parse: ""))
+  }
+
+  public func actorReady<Act>(_ actor: Act)
+      where Act: DistributedActor {
+    print("\(#function):\(actor)")
+  }
+
+  func resignIdentity(_ id: AnyActorIdentity) {}
+}
+
+@available(SwiftStdlib 5.6, *)
+typealias DefaultActorTransport = FakeTransport
 
 // ==== Execute ----------------------------------------------------------------
 
-@available(SwiftStdlib 5.5, *)
+@available(SwiftStdlib 5.6, *)
 func test_initializers() {
   let address = ActorAddress(parse: "")
   let transport = FakeTransport()
 
   _ = SomeSpecificDistributedActor(transport: transport)
-  _ = try! SomeSpecificDistributedActor(resolve: address, using: transport)
+  _ = try! SomeSpecificDistributedActor.resolve(.init(address), using: transport)
 }
 
-@available(SwiftStdlib 5.5, *)
+@available(SwiftStdlib 5.6, *)
 func test_address() {
   let transport = FakeTransport()
 
   let actor = SomeSpecificDistributedActor(transport: transport)
-  _ = actor.actorAddress
+  _ = actor.id
 }
 
-@available(SwiftStdlib 5.5, *)
+@available(SwiftStdlib 5.6, *)
 func test_run(transport: FakeTransport) async {
   let actor = SomeSpecificDistributedActor(transport: transport)
 
@@ -80,7 +96,7 @@ func test_run(transport: FakeTransport) async {
   print("after") // CHECK: after
 }
 
-@available(SwiftStdlib 5.5, *)
+@available(SwiftStdlib 5.6, *)
 func test_echo(transport: FakeTransport) async {
   let actor = SomeSpecificDistributedActor(transport: transport)
 
@@ -88,7 +104,7 @@ func test_echo(transport: FakeTransport) async {
   print("echo: \(echo)") // CHECK: echo: 42
 }
 
-@available(SwiftStdlib 5.5, *)
+@available(SwiftStdlib 5.6, *)
 @main struct Main {
   static func main() async {
     await test_run(transport: FakeTransport())

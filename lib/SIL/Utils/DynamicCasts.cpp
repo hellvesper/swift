@@ -468,8 +468,7 @@ swift::classifyDynamicCast(ModuleDecl *M,
                              : DynamicCastFeasibility::WillFail;
     }
 
-    if (targetMetatype.isAnyExistentialType() &&
-        (isa<ProtocolType>(target) || isa<ProtocolCompositionType>(target))) {
+    if (targetMetatype.isAnyExistentialType() && target->isExistentialType()) {
       auto Feasibility =
           classifyDynamicCastToProtocol(M, source, target, isWholeModuleOpts);
       // Cast from existential metatype to existential metatype may still
@@ -603,12 +602,12 @@ swift::classifyDynamicCast(ModuleDecl *M,
     if (targetClass) {
       // Imported Objective-C generics don't check the generic parameters, which
       // are lost at runtime.
-      if (sourceClass->usesObjCGenericsModel()) {
+      if (sourceClass->isTypeErasedGenericClass()) {
       
         if (sourceClass == targetClass)
           return DynamicCastFeasibility::WillSucceed;
         
-        if (targetClass->usesObjCGenericsModel()) {
+        if (targetClass->isTypeErasedGenericClass()) {
           // If both classes are ObjC generics, the cast may succeed if the
           // classes are related, irrespective of their generic parameters.
 
@@ -848,18 +847,10 @@ namespace {
 
     SILValue getOwnedScalar(Source source, const TypeLowering &srcTL) {
       assert(!source.isAddress());
-      return source.Value;
-    }
-
-    Source putOwnedScalar(SILValue scalar, Target target) {
-      assert(scalar->getType() == target.LoweredType.getObjectType());
-      if (!target.isAddress())
-        return target.asScalarSource(scalar);
-
-      auto &targetTL = getTypeLowering(target.LoweredType);
-      targetTL.emitStoreOfCopy(B, Loc, scalar, target.Address,
-                               IsInitialization);
-      return target.asAddressSource();
+      auto value = source.Value;
+      if (value.getOwnershipKind() == OwnershipKind::Guaranteed)
+        value = B.emitCopyValueOperation(Loc, value);
+      return value;
     }
 
     Source emitSameType(Source source, Target target) {
@@ -917,7 +908,8 @@ namespace {
       if (source.isAddress()) {
         value = srcTL.emitLoadOfCopy(B, Loc, source.Value, IsTake);
       } else {
-        value = getOwnedScalar(source, srcTL);
+        // May have any valid ownership.
+        value = source.Value;
       }
       auto targetFormalTy = target.FormalType;
       auto targetLoweredTy =
@@ -929,7 +921,15 @@ namespace {
       } else {
         value = B.createUpcast(Loc, value, targetLoweredTy);
       }
-      return putOwnedScalar(value, target);
+      // If the target is an address, then scalar must be Owned. Otherwise, it
+      // may be Guaranteed.
+      assert(value->getType() == target.LoweredType.getObjectType());
+      if (!target.isAddress())
+        return target.asScalarSource(value);
+
+      auto &targetTL = getTypeLowering(target.LoweredType);
+      targetTL.emitStoreOfCopy(B, Loc, value, target.Address, IsInitialization);
+      return target.asAddressSource();
     }
 
     Source emitAndInjectIntoOptionals(Source source, Target target,
@@ -961,7 +961,9 @@ namespace {
       if (source.isAddress()) {
         B.createSwitchEnumAddr(Loc, source.Value, /*default*/ nullptr, cases);
       } else {
-        B.createSwitchEnum(Loc, source.Value, /*default*/ nullptr, cases);
+        auto *switchEnum =
+            B.createSwitchEnum(Loc, source.Value, /*default*/ nullptr, cases);
+        switchEnum->createOptionalSomeResult();
       }
 
       // Create the Some block, which recurses.
@@ -988,10 +990,7 @@ namespace {
                                     sourceSomeDecl, loweredSourceObjectType);
           objectSource = Source(sourceAddr, sourceObjectType);
         } else {
-          // switch enum always start as @owned.
-          SILValue sourceObjectValue = someBB->createPhiArgument(
-              loweredSourceObjectType, OwnershipKind::Owned);
-          objectSource = Source(sourceObjectValue, sourceObjectType);
+          objectSource = Source(someBB->getArgument(0), sourceObjectType);
         }
 
         Source resultObject = emit(objectSource, objectTarget);
@@ -1006,7 +1005,9 @@ namespace {
         if (target.isAddress()) {
           B.createBranch(Loc, contBB);
         } else {
-          B.createBranch(Loc, contBB, { result.Value });
+          auto &resultTL = getTypeLowering(result.Value->getType());
+          SILValue resultVal = getOwnedScalar(source, resultTL);
+          B.createBranch(Loc, contBB, {resultVal});
         }
       }
 
@@ -1057,6 +1058,8 @@ namespace {
       }
     }
 
+    // May return an Owned or Guaranteed result. If source is has ownership
+    // None, then the result may still be Guaranteed for nontrivial types.
     Source emitSome(Source source, Target target, EmitSomeState &state) {
       // If our target is an address, prepareForEmitSome should have set this
       // up so that we emitted directly into 
@@ -1064,11 +1067,9 @@ namespace {
         B.createInjectEnumAddr(Loc, target.Address, state.SomeDecl);
         return target.asAddressSource();
       } else {
-        auto &srcTL = getTypeLowering(source.Value->getType());
-        auto sourceObject = getOwnedScalar(source, srcTL);
-        auto source = B.createEnum(Loc, sourceObject, state.SomeDecl,
-                                   target.LoweredType);
-        return target.asScalarSource(source);
+        auto someEnum =
+            B.createEnum(Loc, source.Value, state.SomeDecl, target.LoweredType);
+        return target.asScalarSource(someEnum);
       }
     }
 
@@ -1286,14 +1287,14 @@ void swift::emitIndirectConditionalCastWithScalar(
     return B.emitLoadValueOperation(loc, srcAddr, LoadOwnershipQualifier::Take);
   })();
 
-  B.createCheckedCastBranch(loc, /*exact*/ false, srcValue, targetLoweredType,
-                            targetFormalType, scalarSuccBB, scalarFailBB,
-                            TrueCount, FalseCount);
+  auto *ccb = B.createCheckedCastBranch(
+      loc, /*exact*/ false, srcValue, targetLoweredType, targetFormalType,
+      scalarSuccBB, scalarFailBB, TrueCount, FalseCount);
 
   // Emit the success block.
   B.setInsertionPoint(scalarSuccBB); {
     SILValue succValue = scalarSuccBB->createPhiArgument(
-        targetLoweredType, srcValue.getOwnershipKind());
+        targetLoweredType, ccb->getForwardingOwnershipKind());
 
     switch (consumption) {
     // On success, we take with both take_always and take_on_success.

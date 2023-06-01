@@ -184,9 +184,7 @@ SILGenModule::emitVTableMethod(ClassDecl *theClass,
   if (auto existingThunk = M.lookUpFunction(name))
     return SILVTable::Entry(base, existingThunk, implKind, false);
 
-  GenericEnvironment *genericEnv = nullptr;
-  if (auto genericSig = overrideInfo.FormalType.getOptGenericSignature())
-    genericEnv = genericSig->getGenericEnvironment();
+  auto *genericEnv = overrideInfo.FormalType.getOptGenericSignature().getGenericEnvironment();
 
   // Emit the thunk.
   SILLocation loc(derivedDecl);
@@ -418,7 +416,7 @@ public:
     if (!reqAccessor) {
       if (auto witness = asDerived().getWitness(reqDecl)) {
         return addMethodImplementation(
-            requirementRef, requirementRef.withDecl(witness.getDecl()),
+            requirementRef, getWitnessRef(requirementRef, witness),
             witness);
       }
 
@@ -446,7 +444,8 @@ public:
       witnessStorage->getSynthesizedAccessor(reqAccessor->getAccessorKind());
 
     return addMethodImplementation(
-        requirementRef, requirementRef.withDecl(witnessAccessor), witness);
+        requirementRef, getWitnessRef(requirementRef, witnessAccessor),
+        witness);
   }
 
 private:
@@ -459,6 +458,21 @@ private:
       isFreeFunctionWitness(requirementRef.getDecl(), witnessRef.getDecl());
     asDerived().addMethodImplementation(requirementRef, witnessRef,
                                         isFree, witness);
+  }
+
+  SILDeclRef getWitnessRef(SILDeclRef requirementRef, Witness witness) {
+    auto witnessRef = requirementRef.withDecl(witness.getDecl());
+    // If the requirement/witness is a derivative function, we need to
+    // substitute the witness's derivative generic signature in its derivative
+    // function identifier.
+    if (requirementRef.isAutoDiffDerivativeFunction()) {
+      auto *reqrRerivativeId = requirementRef.getDerivativeFunctionIdentifier();
+      auto *witnessDerivativeId = AutoDiffDerivativeFunctionIdentifier::get(
+          reqrRerivativeId->getKind(), reqrRerivativeId->getParameterIndices(),
+          witness.getDerivativeGenericSignature(), witnessRef.getASTContext());
+      witnessRef = witnessRef.asAutoDiffDerivativeFunction(witnessDerivativeId);
+    }
+    return witnessRef;
   }
 };
 
@@ -817,7 +831,8 @@ static SILFunction *emitSelfConformanceWitness(SILGenModule &SGM,
                                           ProtocolConformanceRef(conformance));
 
   // Open the protocol type.
-  auto openedType = OpenedArchetypeType::get(protocolType);
+  auto openedType = OpenedArchetypeType::get(
+      protocol->getExistentialType()->getCanonicalType());
 
   // Form the substitutions for calling the witness.
   auto witnessSubs = SubstitutionMap::getProtocolSubstitutions(protocol,
@@ -1102,7 +1117,7 @@ public:
       return;
 
     // Emit any default argument generators.
-    SGM.emitDefaultArgGenerators(EED, EED->getParameterList());
+    SGM.emitArgumentGenerators(EED, EED->getParameterList());
   }
 
   void visitPatternBindingDecl(PatternBindingDecl *pd) {
@@ -1137,7 +1152,7 @@ public:
   }
 
   void visitSubscriptDecl(SubscriptDecl *sd) {
-    SGM.emitDefaultArgGenerators(sd, sd->getIndices());
+    SGM.emitArgumentGenerators(sd, sd->getIndices());
     visitAbstractStorageDecl(sd);
   }
 
@@ -1263,7 +1278,7 @@ public:
   }
 
   void visitSubscriptDecl(SubscriptDecl *sd) {
-    SGM.emitDefaultArgGenerators(sd, sd->getIndices());
+    SGM.emitArgumentGenerators(sd, sd->getIndices());
     visitAbstractStorageDecl(sd);
   }
 

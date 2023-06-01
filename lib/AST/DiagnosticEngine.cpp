@@ -547,6 +547,24 @@ static bool typeSpellingIsAmbiguous(Type type,
       auto argType = arg.getAsType();
       if (argType && argType->getWithoutParens().getPointer() != type.getPointer() &&
           argType->getWithoutParens().getString(PO) == type.getString(PO)) {
+        // Currently, existential types are spelled the same way
+        // as protocols and compositions. We can remove this once
+        // existenials are printed with 'any'.
+        if (type->is<ExistentialType>() || argType->isExistentialType()) {
+          auto constraint = type;
+          if (auto existential = type->getAs<ExistentialType>())
+            constraint = existential->getConstraintType();
+
+          auto argConstraint = argType;
+          if (auto existential = argType->getAs<ExistentialType>())
+            argConstraint = existential->getConstraintType();
+
+          if (constraint.getPointer() != argConstraint.getPointer())
+            return true;
+
+          continue;
+        }
+
         return true;
       }
     }
@@ -1244,6 +1262,10 @@ void DiagnosticEngine::emitDiagnostic(const Diagnostic &diagnostic) {
     emitDiagnostic(childNote);
 }
 
+DiagnosticKind DiagnosticEngine::declaredDiagnosticKindFor(const DiagID id) {
+  return storedDiagnosticInfos[(unsigned)id].kind;
+}
+
 llvm::StringRef
 DiagnosticEngine::diagnosticStringFor(const DiagID id,
                                       bool printDiagnosticNames) {
@@ -1321,4 +1343,25 @@ void DiagnosticEngine::onTentativeDiagnosticFlush(Diagnostic &diagnostic) {
     auto I = TransactionStrings.insert(content).first;
     argument = DiagnosticArgument(StringRef(I->getKeyData()));
   }
+}
+
+EncodedDiagnosticMessage::EncodedDiagnosticMessage(StringRef S)
+    : Message(Lexer::getEncodedStringSegment(S, Buf, /*IsFirstSegment=*/true,
+                                             /*IsLastSegment=*/true,
+                                             /*IndentToStrip=*/~0U)) {}
+
+std::pair<unsigned, DeclName>
+swift::getAccessorKindAndNameForDiagnostics(const ValueDecl *D) {
+  // This should always be one more than the last AccessorKind supported in
+  // the diagnostics. If you need to change it, change the assertion below as
+  // well.
+  static const unsigned NOT_ACCESSOR_INDEX = 2;
+
+  if (auto *accessor = dyn_cast<AccessorDecl>(D)) {
+    DeclName Name = accessor->getStorage()->getName();
+    assert(accessor->isGetterOrSetter());
+    return {static_cast<unsigned>(accessor->getAccessorKind()), Name};
+  }
+
+  return {NOT_ACCESSOR_INDEX, D->getName()};
 }

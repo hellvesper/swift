@@ -56,7 +56,7 @@ OperatorsTestSuite.test("ReadWriteIntArray.subscript (inline)") {
 }
 
 OperatorsTestSuite.test("ReadOnlyIntArray.subscript (inline)") {
-  var arr = ReadOnlyIntArray(1)
+  let arr = ReadOnlyIntArray(1)
 
   let result0 = arr[0]
   let result2 = arr[2]
@@ -80,7 +80,7 @@ OperatorsTestSuite.test("WriteOnlyIntArray.subscript (inline)") {
 }
 
 OperatorsTestSuite.test("DifferentTypesArray.subscript (inline)") {
-  var arr = DifferentTypesArray()
+  let arr = DifferentTypesArray()
 
   let resultInt: Int32 = arr[2]
   let resultDouble: Double = arr[0.1]
@@ -184,5 +184,14 @@ OperatorsTestSuite.test("PtrToPtr.subscript (inline)") {
   arr[0]![0] = ptr
   expectEqual(23, arr[0]![0]![0])
 }
+
+// TODO: this causes a crash (does it also crash on main?)
+//OperatorsTestSuite.test("TemplatedSubscriptArrayByVal.subscript (inline)") {
+//  let ptr: UnsafeMutablePointer<Int32> =
+//    UnsafeMutablePointer<Int32>.allocate(capacity: 64)
+//  ptr[0] = 23
+//  var arr = TemplatedSubscriptArrayByVal(ptr: ptr)
+//  expectEqual(23, arr[0])
+//}
 
 runAllTests()

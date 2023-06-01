@@ -352,8 +352,8 @@ private:
   /// Find the tangent space of a given canonical type.
   Optional<TangentSpace> getTangentSpace(CanType type) {
     // Use witness generic signature to remap types.
-    if (auto witnessGenSig = witness->getDerivativeGenericSignature())
-      type = witnessGenSig->getCanonicalTypeInContext(type);
+    type = witness->getDerivativeGenericSignature().getCanonicalTypeInContext(
+        type);
     return type->getAutoDiffTangentSpace(
         LookUpConformanceInModule(getModule().getSwiftModule()));
   }
@@ -1615,9 +1615,7 @@ void JVPCloner::Implementation::prepareForDifferentialGeneration() {
   // signature: when witness generic signature has same-type requirements
   // binding all generic parameters to concrete types, JVP function type uses
   // all the concrete types and JVP generic signature is null.
-  CanGenericSignature witnessCanGenSig;
-  if (auto witnessGenSig = witness->getDerivativeGenericSignature())
-    witnessCanGenSig = witnessGenSig->getCanonicalSignature();
+  auto witnessCanGenSig = witness->getDerivativeGenericSignature().getCanonicalSignature();
   auto lookupConformance = LookUpConformanceInModule(module.getSwiftModule());
 
   // Parameters of the differential are:
@@ -1693,8 +1691,7 @@ void JVPCloner::Implementation::prepareForDifferentialGeneration() {
   // binding all generic parameters to concrete types.
   auto diffGenericSig =
       jvp->getLoweredFunctionType()->getSubstGenericSignature();
-  auto *diffGenericEnv =
-      diffGenericSig ? diffGenericSig->getGenericEnvironment() : nullptr;
+  auto *diffGenericEnv = diffGenericSig.getGenericEnvironment();
   auto diffType = SILFunctionType::get(
       diffGenericSig, SILExtInfo::getThin(), origTy->getCoroutineKind(),
       origTy->getCalleeConvention(), dfParams, {}, dfResults, None,

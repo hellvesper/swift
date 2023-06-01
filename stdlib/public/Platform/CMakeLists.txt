@@ -11,27 +11,75 @@ if(NOT BUILD_STANDALONE)
   list(APPEND darwin_depends copy_apinotes)
 endif()
 
-add_swift_target_library(swiftDarwin ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} IS_SDK_OVERLAY
-    ${swift_platform_sources}
-    POSIXError.swift
-    MachError.swift
+set(swift_platform_compile_flags)
+if(SWIFT_ENABLE_REFLECTION)
+  list(APPEND swift_platform_compile_flags "-DSWIFT_ENABLE_REFLECTION")
+endif()
 
-    "${SWIFT_SOURCE_DIR}/stdlib/linker-support/magic-symbols-for-install-name.c"
+set(swiftDarwin_target_sdks ALL_APPLE_PLATFORMS)
+if(SWIFT_FREESTANDING_FLAVOR STREQUAL "apple")
+  set(swiftDarwin_target_sdks ALL_APPLE_PLATFORMS FREESTANDING)
+endif()
 
-    GYB_SOURCES
-      ${swift_platform_gyb_sources}
-      Darwin.swift.gyb
+set(swiftDarwin_common_options
+      IS_SDK_OVERLAY
+      ${swift_platform_sources}
+      POSIXError.swift
+      MachError.swift
 
-    SWIFT_COMPILE_FLAGS
-      ${SWIFT_RUNTIME_SWIFT_COMPILE_FLAGS}
-      ${SWIFT_STANDARD_LIBRARY_SWIFT_FLAGS}
-      -Xfrontend -disable-objc-attr-requires-foundation-module
-    LINK_FLAGS "${SWIFT_RUNTIME_SWIFT_LINK_FLAGS}"
-    TARGET_SDKS ALL_APPLE_PLATFORMS FREESTANDING
-    INSTALL_IN_COMPONENT sdk-overlay
+      "${SWIFT_SOURCE_DIR}/stdlib/linker-support/magic-symbols-for-install-name.c"
 
-    DEPENDS ${darwin_depends})
+      GYB_SOURCES
+        ${swift_platform_gyb_sources}
+        Darwin.swift.gyb
 
+      SWIFT_COMPILE_FLAGS
+        ${SWIFT_RUNTIME_SWIFT_COMPILE_FLAGS}
+        ${SWIFT_STANDARD_LIBRARY_SWIFT_FLAGS}
+        -Xfrontend -disable-objc-attr-requires-foundation-module
+        ${swift_platform_compile_flags}
+      LINK_FLAGS "${SWIFT_RUNTIME_SWIFT_LINK_FLAGS}"
+      DEPENDS ${darwin_depends})
+
+
+if(${LIBSWIFT_BUILD_MODE} STREQUAL "BOOTSTRAPPING" AND
+   ${SWIFT_HOST_VARIANT_SDK} IN_LIST SWIFT_DARWIN_PLATFORMS)
+
+  set(swiftDarwin_common_bootstrapping_options
+      ${swiftDarwin_common_options}
+      SHARED
+      IS_STDLIB
+      SDK ${SWIFT_HOST_VARIANT_SDK}
+      ARCHITECTURE ${SWIFT_HOST_VARIANT_ARCH}
+      INSTALL_IN_COMPONENT "never_install")
+
+  set(b0_deps swiftCore-bootstrapping0)
+  set(b1_deps swiftCore-bootstrapping1)
+  if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(b0_deps ${b0_deps} swiftSwiftOnoneSupport-bootstrapping0)
+    set(b1_deps ${b1_deps} swiftSwiftOnoneSupport-bootstrapping1)
+  endif()
+
+  add_swift_target_library_single(swiftDarwin-bootstrapping0 swiftDarwin
+      ${swiftDarwin_common_bootstrapping_options}
+      FILE_DEPENDS ${b0_deps}
+      BOOTSTRAPPING 0)
+
+  add_swift_target_library_single(swiftDarwin-bootstrapping1 swiftDarwin
+      ${swiftDarwin_common_bootstrapping_options}
+      FILE_DEPENDS ${b1_deps}
+      BOOTSTRAPPING 1)
+endif()
+
+add_swift_target_library(swiftDarwin ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES}
+    ${swiftDarwin_common_options}
+    TARGET_SDKS "${swiftDarwin_target_sdks}"
+    INSTALL_IN_COMPONENT sdk-overlay)
+
+set(swiftGlibc_target_sdks ANDROID CYGWIN FREEBSD OPENBSD LINUX HAIKU)
+if(SWIFT_FREESTANDING_FLAVOR STREQUAL "linux")
+  set(swiftGlibc_target_sdks ANDROID CYGWIN FREEBSD OPENBSD LINUX HAIKU FREESTANDING)
+endif()
 add_swift_target_library(swiftGlibc ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} IS_SDK_OVERLAY
     ${swift_platform_sources}
     POSIXError.swift
@@ -43,8 +91,9 @@ add_swift_target_library(swiftGlibc ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} IS_SDK_O
     SWIFT_COMPILE_FLAGS
       ${SWIFT_RUNTIME_SWIFT_COMPILE_FLAGS}
       ${SWIFT_STANDARD_LIBRARY_SWIFT_FLAGS}
+      ${swift_platform_compile_flags}
     LINK_FLAGS "${SWIFT_RUNTIME_SWIFT_LINK_FLAGS}"
-    TARGET_SDKS ANDROID CYGWIN FREEBSD OPENBSD LINUX HAIKU
+    TARGET_SDKS "${swiftGlibc_target_sdks}"
     INSTALL_IN_COMPONENT sdk-overlay
     DEPENDS glibc_modulemap)
 
@@ -60,6 +109,7 @@ add_swift_target_library(swiftCRT ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} IS_SDK_OVE
       ${SWIFT_RUNTIME_SWIFT_COMPILE_FLAGS}
       ${SWIFT_STANDARD_LIBRARY_SWIFT_FLAGS}
       -Xcc -D_USE_MATH_DEFINES
+      ${swift_platform_compile_flags}
     LINK_FLAGS "${SWIFT_RUNTIME_SWIFT_LINK_FLAGS}"
     TARGET_SDKS WINDOWS
     INSTALL_IN_COMPONENT sdk-overlay)
@@ -101,8 +151,7 @@ foreach(sdk ${SWIFT_SDKS})
         OUTPUT "${glibc_modulemap_out}"
         FLAGS
             "-DCMAKE_SDK=${sdk}"
-            "-DGLIBC_INCLUDE_PATH=${SWIFT_SDK_${sdk}_ARCH_${arch}_LIBC_INCLUDE_DIRECTORY}"
-            "-DGLIBC_ARCH_INCLUDE_PATH=${SWIFT_SDK_${sdk}_ARCH_${arch}_LIBC_ARCHITECTURE_INCLUDE_DIRECTORY}")
+            "-DGLIBC_INCLUDE_PATH=${SWIFT_SDK_${sdk}_ARCH_${arch}_LIBC_INCLUDE_DIRECTORY}")
 
     list(APPEND glibc_modulemap_target_list ${glibc_modulemap_target})
 
@@ -141,15 +190,12 @@ foreach(sdk ${SWIFT_SDKS})
 
       string(REPLACE "${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_ARCH_${arch}_PATH}"
         "" absolute_libc_include_path "${SWIFT_SDK_${sdk}_ARCH_${arch}_LIBC_INCLUDE_DIRECTORY}")
-      string(REPLACE "${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_ARCH_${arch}_PATH}"
-        "" absolute_libc_arch_include_path ${SWIFT_SDK_${sdk}_ARCH_${arch}_LIBC_ARCHITECTURE_INCLUDE_DIRECTORY})
 
       handle_gyb_source_single(glibc_modulemap_native_target
         SOURCE "${glibc_modulemap_source}"
         OUTPUT "${glibc_sysroot_relative_modulemap_out}"
         FLAGS "-DCMAKE_SDK=${sdk}"
-              "-DGLIBC_INCLUDE_PATH=${absolute_libc_include_path}"
-              "-DGLIBC_ARCH_INCLUDE_PATH=${absolute_libc_arch_include_path}")
+              "-DGLIBC_INCLUDE_PATH=${absolute_libc_include_path}")
 
       list(APPEND glibc_modulemap_target_list ${glibc_modulemap_native_target})
       set(glibc_modulemap_out ${glibc_sysroot_relative_modulemap_out})

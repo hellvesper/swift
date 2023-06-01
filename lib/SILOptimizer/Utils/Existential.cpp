@@ -86,10 +86,11 @@ static SILInstruction *getStackInitInst(SILValue allocStackAddr,
 
     // Ignore instructions which don't write to the stack location.
     // Also ignore ASIUser (only kicks in if ASIUser is the original apply).
-    if (isa<DeallocStackInst>(User) || isa<DebugValueAddrInst>(User) ||
+    if (isa<DeallocStackInst>(User) ||
+        DebugValueInst::hasAddrVal(User) ||
         isa<DestroyAddrInst>(User) || isa<WitnessMethodInst>(User) ||
         isa<DeinitExistentialAddrInst>(User) ||
-        isa<OpenExistentialAddrInst>(User) || User == ASIUser) {
+        OpenExistentialAddrInst::isRead(User) || User == ASIUser) {
       continue;
     }
     if (auto *CAI = dyn_cast<CopyAddrInst>(User)) {

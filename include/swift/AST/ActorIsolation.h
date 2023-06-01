@@ -106,6 +106,22 @@ public:
   operator Kind() const { return getKind(); }
 
   bool isUnspecified() const { return kind == Unspecified; }
+  
+  bool isIndependent() const { return kind == Independent; }
+
+  bool isActorIsolated() const {
+    switch (getKind()) {
+    case ActorInstance:
+    case DistributedActorInstance:
+    case GlobalActor:
+    case GlobalActorUnsafe:
+      return true;
+
+    case Unspecified:
+    case Independent:
+      return false;
+    }
+  }
 
   NominalTypeDecl *getActor() const {
     assert(getKind() == ActorInstance || getKind() == DistributedActorInstance);
@@ -130,6 +146,9 @@ public:
 
   friend bool operator==(const ActorIsolation &lhs,
                          const ActorIsolation &rhs) {
+    if (lhs.isGlobalActor() && rhs.isGlobalActor())
+      return areTypesEqual(lhs.globalActor, rhs.globalActor);
+
     if (lhs.kind != rhs.kind)
       return false;
 
@@ -144,7 +163,7 @@ public:
 
     case GlobalActor:
     case GlobalActorUnsafe:
-      return areTypesEqual(lhs.globalActor, rhs.globalActor);
+      llvm_unreachable("Global actors handled above");
     }
   }
 

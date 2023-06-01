@@ -109,6 +109,7 @@ class SILUndef;
 class SourceFile;
 class SerializedSILLoader;
 class SILFunctionBuilder;
+class SILOptFunctionBuilder;
 class SILRemarkStreamer;
 
 namespace Lowering {
@@ -352,6 +353,8 @@ private:
   /// lowering ownership in transparent functions.
   /// This gets set in OwnershipModelEliminator pass.
   bool regDeserializationNotificationHandlerForAllFuncOME;
+
+  bool prespecializedFunctionDeclsImported;
 
   /// Action to be executed for serializing the SILModule.
   ActionCallback SerializeSILAction;
@@ -894,11 +897,35 @@ public:
   /// declaration context ought to be serialized as part of this module.
   bool
   shouldSerializeEntitiesAssociatedWithDeclContext(const DeclContext *DC) const;
+
+  /// Gather prespecialized from extensions.
+  void performOnceForPrespecializedImportedExtensions(
+      llvm::function_ref<void(AbstractFunctionDecl *)> action);
 };
 
 inline llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, const SILModule &M){
   M.print(OS);
   return OS;
+}
+
+inline bool SILOptions::supportsLexicalLifetimes(const SILModule &mod) const {
+  switch (mod.getStage()) {
+  case SILStage::Raw:
+    // In raw SIL, lexical markers are used for diagnostics.  These markers are
+    // present as long as the lexical lifetimes feature is not disabled
+    // entirely.
+    return LexicalLifetimes != LexicalLifetimesOption::Off;
+  case SILStage::Canonical:
+    // In Canonical SIL, lexical markers are used to ensure that object
+    // lifetimes do not get observably shortened from the end of a lexical
+    // scope.  That behavior only occurs when lexical lifetimes is (fully)
+    // enabled.  (When only diagnostic markers are enabled, the markers are
+    // stripped as part of lowering from raw to canonical SIL.)
+    return LexicalLifetimes == LexicalLifetimesOption::On;
+  case SILStage::Lowered:
+    // We do not support OSSA in Lowered SIL, so this is always false.
+    return false;
+  }
 }
 
 /// Print a simple description of a SILModule for the request evaluator.

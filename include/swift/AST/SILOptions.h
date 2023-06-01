@@ -30,6 +30,36 @@
 
 namespace swift {
 
+enum class LexicalLifetimesOption : uint8_t {
+  // Do not insert lexical markers.
+  Off = 0,
+
+  // Insert lexical markers via lexical borrow scopes and the lexical flag on
+  // alloc_stacks produced from alloc_boxes, but strip them when lowering out of
+  // Raw SIL.
+  DiagnosticMarkersOnly,
+
+  // Insert lexical markers and use them to lengthen object lifetime based on
+  // lexical scope.
+  On,
+};
+
+enum class CopyPropagationOption : uint8_t {
+  // Do not add any copy propagation passes.
+  Off = 0,
+
+  // Only add the copy propagation passes requested by other flags, currently
+  // just -enable-ossa-modules.
+  RequestedPassesOnly,
+
+  // Add all relevant copy propagation passes.  If a setting, e.g.
+  // -enable-ossa-modules, requests to add copy propagation to the pipeline, do
+  // so.
+  On
+};
+
+class SILModule;
+
 class SILOptions {
 public:
   /// Controls the aggressiveness of the performance inliner.
@@ -44,15 +74,16 @@ public:
   /// Remove all runtime assertions during optimizations.
   bool RemoveRuntimeAsserts = false;
 
-  /// Force-run SIL copy propagation to shorten object lifetime in whatever
-  /// optimization pipeline is currently used.
-  /// When this is 'false' the pipeline has default behavior.
-  bool EnableCopyPropagation = false;
+  /// Enable experimental support for emitting defined borrow scopes.
+  LexicalLifetimesOption LexicalLifetimes =
+      LexicalLifetimesOption::DiagnosticMarkersOnly;
 
-  /// Disable SIL copy propagation to preserve object lifetime in whatever
+  /// Whether to run SIL copy propagation to shorten object lifetime in whatever
   /// optimization pipeline is currently used.
-  /// When this is 'false' the pipeline has default behavior.
-  bool DisableCopyPropagation = false;
+  ///
+  /// When this is 'RequestedPassesOnly' the pipeline has default behavior.
+  CopyPropagationOption CopyPropagation =
+      CopyPropagationOption::RequestedPassesOnly;
 
   /// Controls whether the SIL ARC optimizations are run.
   bool EnableARCOptimizations = true;
@@ -75,7 +106,10 @@ public:
 
   /// Controls whether cross module optimization is enabled.
   bool CrossModuleOptimization = false;
-  
+
+  /// Enables experimental performance annotations.
+  bool EnablePerformanceAnnotations = false;
+
   /// Controls whether or not paranoid verification checks are run.
   bool VerifyAll = false;
 
@@ -189,6 +223,15 @@ public:
   /// }
   bool EnableDynamicReplacementCanCallPreviousImplementation = true;
 
+  /// Are we parsing the stdlib, i.e. -parse-stdlib?
+  bool ParseStdlib = false;
+
+  /// If true, check for leaking instructions when the SILModule is destructed.
+  ///
+  /// Warning: this is not thread safe. It can only be enabled in case there
+  /// is a single SILModule in a single thread.
+  bool checkSILModuleLeaks = false;
+
   /// The name of the file to which the backend should save optimization
   /// records.
   std::string OptRecordFile;
@@ -211,6 +254,12 @@ public:
   bool shouldOptimize() const {
     return OptMode > OptimizationMode::NoOptimization;
   }
+
+  /// Returns true if we support inserting lexical lifetimes given the current
+  /// SIL stage.
+  ///
+  /// Defined in SILModule.h.
+  bool supportsLexicalLifetimes(const SILModule &mod) const;
 };
 
 } // end namespace swift

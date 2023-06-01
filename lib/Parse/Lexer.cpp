@@ -20,6 +20,7 @@
 #include "swift/AST/Identifier.h"
 #include "swift/Basic/LangOptions.h"
 #include "swift/Basic/SourceManager.h"
+#include "swift/Parse/ExperimentalRegexBridging.h"
 #include "swift/Syntax/Trivia.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/MathExtras.h"
@@ -1788,12 +1789,14 @@ static void validateMultilineIndents(const Token &Str,
 
 /// Emit diagnostics for single-quote string and suggest replacement
 /// with double-quoted equivalent.
-static void diagnoseSingleQuoteStringLiteral(const char *TokStart,
-                                             const char *TokEnd,
-                                             DiagnosticEngine *D) {
+void Lexer::diagnoseSingleQuoteStringLiteral(const char *TokStart,
+                                             const char *TokEnd) {
   assert(*TokStart == '\'' && TokEnd[-1] == '\'');
-  if (!D)
+  if (!Diags) // or assert?
     return;
+
+  auto startLoc = Lexer::getSourceLoc(TokStart);
+  auto endLoc = Lexer::getSourceLoc(TokEnd);
 
   SmallString<32> replacement;
   replacement.push_back('"');
@@ -1826,9 +1829,8 @@ static void diagnoseSingleQuoteStringLiteral(const char *TokStart,
   replacement.append(OutputPtr, Ptr - 1);
   replacement.push_back('"');
 
-  D->diagnose(Lexer::getSourceLoc(TokStart), diag::lex_single_quote_string)
-      .fixItReplaceChars(Lexer::getSourceLoc(TokStart),
-                         Lexer::getSourceLoc(TokEnd), replacement);
+  Diags->diagnose(startLoc, diag::lex_single_quote_string)
+      .fixItReplaceChars(startLoc, endLoc, replacement);
 }
 
 /// lexStringLiteral:
@@ -1895,7 +1897,7 @@ void Lexer::lexStringLiteral(unsigned CustomDelimiterLen) {
   if (QuoteChar == '\'') {
     assert(!IsMultilineString && CustomDelimiterLen == 0 &&
            "Single quoted string cannot have custom delimitor, nor multiline");
-    diagnoseSingleQuoteStringLiteral(TokStart, CurPtr, Diags);
+    diagnoseSingleQuoteStringLiteral(TokStart, CurPtr);
   }
 
   if (wasErroneous)
@@ -1949,6 +1951,37 @@ const char *Lexer::findEndOfCurlyQuoteStringLiteral(const char *Body,
   }
 }
 
+void Lexer::lexRegexLiteral(const char *TokStart) {
+  assert(*TokStart == '\'');
+
+  bool HadError = false;
+  while (true) {
+    // Check if we reached the end of the literal without terminating.
+    if (CurPtr >= BufferEnd || *CurPtr == '\n' || *CurPtr == '\r') {
+      diagnose(TokStart, diag::lex_unterminated_regex);
+      return formToken(tok::unknown, TokStart);
+    }
+
+    const auto *CharStart = CurPtr;
+    uint32_t CharValue = validateUTF8CharacterAndAdvance(CurPtr, BufferEnd);
+    if (CharValue == ~0U) {
+      diagnose(CharStart, diag::lex_invalid_utf8);
+      HadError = true;
+      continue;
+    }
+    if (CharValue == '\\' && (*CurPtr == '\'' || *CurPtr == '\\')) {
+      // Skip escaped delimiter or \.
+      CurPtr++;
+    } else if (CharValue == '\'') {
+      // End of literal, stop.
+      break;
+    }
+  }
+  if (HadError)
+    return formToken(tok::unknown, TokStart);
+
+  formToken(tok::regex_literal, TokStart);
+}
 
 /// lexEscapedIdentifier:
 ///   identifier ::= '`' identifier '`'
@@ -2145,9 +2178,10 @@ void Lexer::tryLexEditorPlaceholder() {
     if (Ptr[0] == '<' && Ptr[1] == '#')
       break;
     if (Ptr[0] == '#' && Ptr[1] == '>') {
-      // Found it. Flag it as error (or warning, if in playground mode) for the
-      // rest of the compiler pipeline and lex it as an identifier.
-      if (LangOpts.Playground) {
+      // Found it. Flag it as error (or warning, if in playground mode or we've
+      // been asked to warn) for the rest of the compiler pipeline and lex it
+      // as an identifier.
+      if (LangOpts.Playground || LangOpts.WarnOnEditorPlaceholder) {
         diagnose(TokStart, diag::lex_editor_placeholder_in_playground);
       } else {
         diagnose(TokStart, diag::lex_editor_placeholder);
@@ -2348,7 +2382,11 @@ void Lexer::lexImpl() {
 
   // Remember the start of the token so we can form the text range.
   const char *TokStart = CurPtr;
-  
+
+  if (LexerCutOffPoint && CurPtr >= LexerCutOffPoint) {
+    return formToken(tok::eof, TokStart);
+  }
+
   switch (*CurPtr++) {
   default: {
     char const *Tmp = CurPtr-1;
@@ -2488,8 +2526,16 @@ void Lexer::lexImpl() {
   case '5': case '6': case '7': case '8': case '9':
     return lexNumber();
 
-  case '"':
   case '\'':
+    // If we have experimental string processing enabled, and have the parsing
+    // logic for regex literals, lex a single quoted string as a regex literal.
+    if (LangOpts.EnableExperimentalStringProcessing &&
+        Parser_hasParseRegexStrawperson()) {
+      return lexRegexLiteral(TokStart);
+    }
+    // Otherwise lex as a string literal and emit a diagnostic.
+    LLVM_FALLTHROUGH;
+  case '"':
     return lexStringLiteral();
       
   case '`':

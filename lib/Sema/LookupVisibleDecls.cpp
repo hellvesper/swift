@@ -477,6 +477,12 @@ static void lookupDeclsFromProtocolsBeingConformedTo(
           if (!isDeclVisibleInLookupMode(VD, LS, FromContext))
             continue;
 
+          if (isa<TypeAliasDecl>(VD)) {
+            // Typealias declarations of the protocol are always visible in
+            // types that inherits from it.
+            Consumer.foundDecl(VD, ReasonForThisProtocol);
+            continue;
+          }
           if (!VD->isProtocolRequirement())
             continue;
 
@@ -660,6 +666,13 @@ static void lookupVisibleMemberDeclsImpl(
     for (auto Member : PC->getMembers())
       lookupVisibleMemberDeclsImpl(Member, Consumer, CurrDC, LS, Reason,
                                    Sig, Visited);
+    return;
+  }
+
+  if (auto *existential = BaseTy->getAs<ExistentialType>()) {
+    auto constraint = existential->getConstraintType();
+    lookupVisibleMemberDeclsImpl(constraint, Consumer, CurrDC, LS, Reason,
+                                 Sig, Visited);
     return;
   }
 

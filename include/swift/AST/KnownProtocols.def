@@ -69,6 +69,7 @@ PROTOCOL(Error)
 PROTOCOL_(ErrorCodeProtocol)
 PROTOCOL(OptionSet)
 PROTOCOL(CaseIterable)
+PROTOCOL(SIMD)
 PROTOCOL(SIMDScalar)
 PROTOCOL(BinaryInteger)
 PROTOCOL(RangeReplaceableCollection)
@@ -96,6 +97,7 @@ PROTOCOL(Differentiable)
 
 // Distributed Actors
 PROTOCOL(DistributedActor)
+PROTOCOL(ActorIdentity)
 PROTOCOL(ActorTransport)
 
 PROTOCOL(AsyncSequence)

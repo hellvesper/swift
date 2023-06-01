@@ -1,30 +1,39 @@
-// RUN: %target-typecheck-verify-swift -enable-experimental-distributed
+// RUN: %target-typecheck-verify-swift -enable-experimental-distributed -disable-availability-checking
 // REQUIRES: concurrency
 // REQUIRES: distributed
 
 import _Distributed
 
-@available(SwiftStdlib 5.5, *)
-distributed struct StructNope {} // expected-error{{distributed' modifier cannot be applied to this declaration}}
-@available(SwiftStdlib 5.5, *)
-distributed class ClassNope {} // expected-error{{'distributed' can only be applied to 'actor' definitions, and distributed actor-isolated async functions}}
-@available(SwiftStdlib 5.5, *)
-distributed enum EnumNope {} // expected-error{{distributed' modifier cannot be applied to this declaration}}
+/// Use the existential wrapper as the default actor transport.
+typealias DefaultActorTransport = AnyActorTransport
 
-@available(SwiftStdlib 5.5, *)
 distributed actor DA {
+}
 
-  class func classFunc() {
-    // expected-error@-1{{class methods are only allowed within classes; use 'static' to declare a static method}}
+distributed actor First {
+  distributed func one(second: Second) async throws {
+    try await second.two(first: self, second: second)
   }
+}
 
-  nonisolated distributed func nonisolatedDistributed() async {
-    // expected-error@-1{{function 'nonisolatedDistributed()' cannot be both 'nonisolated' and 'distributed'}}{{3-15=}}
+distributed actor Second {
+  distributed func two(first: First, second: Second) async {
+    try! await first.one(second: self)
+  }
+}
+
+// ==== ------------------------------------------------------------------------
+
+extension First {
+  @_dynamicReplacement (for :_remote_one(second:))
+  nonisolated func _impl_one(second: Second) async throws {
     fatalError()
   }
+}
 
-  distributed nonisolated func distributedNonisolated() async {
-    // expected-error@-1{{function 'distributedNonisolated()' cannot be both 'nonisolated' and 'distributed'}}{{15-27=}}
+extension Second {
+  @_dynamicReplacement (for :_remote_two(first:second:))
+  nonisolated func _impl_two(first: First, second: Second) async throws {
     fatalError()
   }
 }

@@ -418,7 +418,11 @@ public:
           return nullptr;
         }
       } else {
-        resolved = RemoteAbsolutePointer("", remoteAddress);
+        resolved = Reader->resolvePointer(RemoteAddress(remoteAddress), 0);
+        if (resolved.getSymbol().empty()) {
+          // No symbol found, use the already calculated address.
+          resolved = RemoteAbsolutePointer("", remoteAddress);
+        }
       }
 
       switch (kind) {
@@ -690,6 +694,28 @@ public:
                              RemoteAddress(StartOfValue));
   }
 
+  /// Given a known-opaque existential, discover if its value is inlined in
+  /// the existential container.
+  llvm::Optional<bool>
+  isValueInlinedInExistentialContainer(RemoteAddress ExistentialAddress) {
+    // OpaqueExistentialContainer is the layout of an opaque existential.
+    // `Type` is the pointer to the metadata.
+    TargetOpaqueExistentialContainer<Runtime> Container;
+    if (!Reader->readBytes(RemoteAddress(ExistentialAddress),
+                           (uint8_t *)&Container, sizeof(Container)))
+      return None;
+    auto MetadataAddress = static_cast<StoredPointer>(Container.Type);
+    auto Metadata = readMetadata(MetadataAddress);
+    if (!Metadata)
+      return None;
+
+    auto VWT = readValueWitnessTable(MetadataAddress);
+    if (!VWT)
+      return None;
+
+    return VWT->isValueInline();
+  }
+
   /// Read a protocol from a reference to said protocol.
   template<typename Resolver>
   typename Resolver::Result readProtocol(
@@ -933,7 +959,11 @@ public:
       if (!node || node->getKind() != Node::Kind::Type)
         return BuiltType();
 
-      auto name = Demangle::mangleNode(node);
+      auto mangling = Demangle::mangleNode(node);
+      if (!mangling.isSuccess())
+        return BuiltType();
+      auto name = mangling.result();
+
       auto BuiltForeign = Builder.createForeignClassType(std::move(name));
       TypeCache[MetadataAddress] = BuiltForeign;
       return BuiltForeign;
@@ -2216,25 +2246,21 @@ private:
       return false;
     };
 
-    bool isTypeContext = false;
     switch (auto contextKind = descriptor->getKind()) {
     case ContextDescriptorKind::Class:
       if (!getContextName())
         return nullptr;
       nodeKind = Demangle::Node::Kind::Class;
-      isTypeContext = true;
       break;
     case ContextDescriptorKind::Struct:
       if (!getContextName())
         return nullptr;
       nodeKind = Demangle::Node::Kind::Structure;
-      isTypeContext = true;
       break;
     case ContextDescriptorKind::Enum:
       if (!getContextName())
         return nullptr;
       nodeKind = Demangle::Node::Kind::Enum;
-      isTypeContext = true;
       break;
     case ContextDescriptorKind::Protocol: {
       if (!getContextName())

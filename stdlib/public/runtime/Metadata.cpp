@@ -27,6 +27,7 @@
 #include "swift/Runtime/HeapObject.h"
 #include "swift/Runtime/Mutex.h"
 #include "swift/Runtime/Once.h"
+#include "swift/Runtime/Portability.h"
 #include "swift/Strings.h"
 #include "llvm/ADT/StringExtras.h"
 #include <algorithm>
@@ -41,13 +42,6 @@
 // Avoid defining macro max(), min() which conflict with std::max(), std::min()
 #define NOMINMAX
 #include <windows.h>
-#else
-#include <sys/mman.h>
-#include <unistd.h>
-// WASI doesn't support dynamic linking yet.
-#if !defined(__wasi__)
-#include <dlfcn.h>
-#endif // !defined(__wasi__)
 #endif
 #if SWIFT_PTRAUTH
 #include <ptrauth.h>
@@ -63,10 +57,6 @@ extern "C" void _objc_setClassCopyFixupHandler(void (* _Nonnull newFixupHandler)
 #include "ExistentialMetadataImpl.h"
 #include "swift/Runtime/Debug.h"
 #include "Private.h"
-
-#if defined(__APPLE__)
-#include <mach/vm_page_size.h>
-#endif
 
 #if SWIFT_OBJC_INTEROP
 #include "ObjCRuntimeGetImageNameFromClass.h"
@@ -268,14 +258,41 @@ namespace {
       VariadicMetadataCacheEntryBase<GenericCacheEntry> {
     static const char *getName() { return "GenericCache"; }
 
-    template <class... Args>
-    GenericCacheEntry(MetadataCacheKey key, Args &&...args)
-      : VariadicMetadataCacheEntryBase(key) {}
+    // The constructor/allocate operations that take a `const Metadata *`
+    // are used for the insertion of canonical specializations.
+    // The metadata is always complete after construction.
+
+    GenericCacheEntry(MetadataCacheKey key,
+                      MetadataWaitQueue::Worker &worker,
+                      MetadataRequest request,
+                      const Metadata *candidate)
+      : VariadicMetadataCacheEntryBase(key, worker,
+                                       PrivateMetadataState::Complete,
+                                       const_cast<Metadata*>(candidate)) {}
 
     AllocationResult allocate(const Metadata *candidate) {
-      return {const_cast<Metadata *>(candidate),
-              PrivateMetadataState::Complete};
+      swift_unreachable("always short-circuited");
     }
+
+    static bool allowMangledNameVerification(const Metadata *candidate) {
+      // Disallow mangled name verification for specialized candidates
+      // because it will trigger recursive entry into the swift_once
+      // in cacheCanonicalSpecializedMetadata.
+      // TODO: verify mangled names in a second pass in that function.
+      return false;
+    }
+
+    // The constructor/allocate operations that take a descriptor
+    // and arguments are used along the normal allocation path.
+
+    GenericCacheEntry(MetadataCacheKey key,
+                      MetadataWaitQueue::Worker &worker,
+                      MetadataRequest request,
+                      const TypeContextDescriptor *description,
+                      const void * const *arguments)
+      : VariadicMetadataCacheEntryBase(key, worker,
+                                       PrivateMetadataState::Allocating,
+                                       /*candidate*/ nullptr) {}
 
     AllocationResult allocate(const TypeContextDescriptor *description,
                               const void * const *arguments) {
@@ -305,7 +322,13 @@ namespace {
       return { metadata, state };
     }
 
-    TryInitializeResult tryInitialize(Metadata *metadata,
+    static bool allowMangledNameVerification(
+                                  const TypeContextDescriptor *description,
+                                             const void * const *arguments) {
+      return true;
+    }
+
+    MetadataStateWithDependency tryInitialize(Metadata *metadata,
                                       PrivateMetadataState state,
                                PrivateMetadataCompletionContext *context) {
       assert(state != PrivateMetadataState::Complete);
@@ -839,7 +862,10 @@ namespace {
 
     static const char *getName() { return "SingletonMetadataCache"; }
 
-    SingletonMetadataCacheEntry() {}
+    SingletonMetadataCacheEntry(MetadataWaitQueue::Worker &worker,
+                                MetadataRequest request,
+                                const TypeContextDescriptor *description)
+      : MetadataCacheEntryBase(worker) {}
 
     AllocationResult allocate(const TypeContextDescriptor *description) {
       auto &initialization = description->getSingletonMetadataInitialization();
@@ -852,7 +878,7 @@ namespace {
       return { metadata, state };
     }
 
-    TryInitializeResult tryInitialize(Metadata *metadata,
+    MetadataStateWithDependency tryInitialize(Metadata *metadata,
                                       PrivateMetadataState state,
                                PrivateMetadataCompletionContext *context) {
       assert(state != PrivateMetadataState::Complete);
@@ -919,7 +945,8 @@ namespace {
       // If there isn't one there, optimistically create an entry and
       // try to swap it in.
       if (!existingEntry) {
-        auto allocatedEntry = new SingletonMetadataCacheEntry();
+        auto allocatedEntry =
+          new SingletonMetadataCacheEntry(std::forward<ArgTys>(args)...);
         if (cache.Private.compare_exchange_strong(existingEntry,
                                                   allocatedEntry,
                                                   std::memory_order_acq_rel,
@@ -1363,16 +1390,19 @@ public:
     assert(value == &Data);
   }
 
-  TupleCacheEntry(const Key &key, MetadataRequest request,
+  TupleCacheEntry(const Key &key, MetadataWaitQueue::Worker &worker,
+                  MetadataRequest request,
                   const ValueWitnessTable *proposedWitnesses);
 
-  AllocationResult allocate(const ValueWitnessTable *proposedWitnesses);
+  AllocationResult allocate(const ValueWitnessTable *proposedWitnesses) {
+    swift_unreachable("allocated during construction");
+  }
 
-  TryInitializeResult tryInitialize(Metadata *metadata,
+  MetadataStateWithDependency tryInitialize(Metadata *metadata,
                                     PrivateMetadataState state,
                                     PrivateMetadataCompletionContext *context);
 
-  TryInitializeResult checkTransitiveCompleteness() {
+  MetadataStateWithDependency checkTransitiveCompleteness() {
     auto dependency = ::checkTransitiveCompleteness(&Data);
     return { dependency ? PrivateMetadataState::NonTransitiveComplete
                         : PrivateMetadataState::Complete,
@@ -1861,7 +1891,7 @@ swift::swift_getTupleTypeMetadata(MetadataRequest request,
   size_t labelsAllocSize = roundUpToAlignment(labelsLen + 1, sizeof(void*));
   char *newLabels =
     (char *) MetadataAllocator(TupleCacheTag).Allocate(labelsAllocSize, alignof(char));
-  strcpy(newLabels, labels);
+  _swift_strlcpy(newLabels, labels, labelsAllocSize);
   key.Labels = newLabels;
 
   // Update the metadata cache.
@@ -1877,8 +1907,11 @@ swift::swift_getTupleTypeMetadata(MetadataRequest request,
   return result;
 }
 
-TupleCacheEntry::TupleCacheEntry(const Key &key, MetadataRequest request,
-                                 const ValueWitnessTable *proposedWitnesses) {
+TupleCacheEntry::TupleCacheEntry(const Key &key,
+                                 MetadataWaitQueue::Worker &worker,
+                                 MetadataRequest request,
+                                 const ValueWitnessTable *proposedWitnesses)
+    : MetadataCacheEntryBase(worker, PrivateMetadataState::Abstract) {
   Data.setKind(MetadataKind::Tuple);
   Data.NumElements = key.NumElements;
   Data.Labels = key.Labels;
@@ -1892,13 +1925,7 @@ TupleCacheEntry::TupleCacheEntry(const Key &key, MetadataRequest request,
   assert(TupleCacheStorage::resolveExistingEntry(&Data) == this);
 }
 
-TupleCacheEntry::AllocationResult
-TupleCacheEntry::allocate(const ValueWitnessTable *proposedWitnesses) {
-  // All the work we can reasonably do here was done in the constructor.
-  return { &Data, PrivateMetadataState::Abstract };
-}
-
-TupleCacheEntry::TryInitializeResult
+MetadataStateWithDependency
 TupleCacheEntry::tryInitialize(Metadata *metadata,
                                PrivateMetadataState state,
                                PrivateMetadataCompletionContext *context) {
@@ -2547,7 +2574,11 @@ static char *copyGenericClassObjCName(ClassMetadata *theClass) {
   auto globalNode = Dem.createNode(Demangle::Node::Kind::Global);
   globalNode->addChild(typeNode, Dem);
 
-  llvm::StringRef string = Demangle::mangleNodeOld(globalNode, Dem);
+  auto mangling = Demangle::mangleNodeOld(globalNode, Dem);
+  if (!mangling.isSuccess()) {
+    return nullptr;
+  }
+  llvm::StringRef string = mangling.result();
 
   // If the class is in the Swift module, add a $ to the end of the ObjC
   // name. The old and new Swift libraries must be able to coexist in
@@ -3268,7 +3299,9 @@ swift::swift_lookUpClassMethod(const ClassMetadata *metadata,
                                const ClassDescriptor *description) {
   assert(metadata->isTypeMetadata());
 
+#ifndef NDEBUG
   assert(isAncestorOf(metadata, description));
+#endif
 
   auto *vtable = description->getVTableDescriptor();
   assert(vtable != nullptr);
@@ -3490,13 +3523,17 @@ swift::swift_getExistentialMetatypeMetadata(const Metadata *instanceMetadata) {
 ExistentialMetatypeCacheEntry::ExistentialMetatypeCacheEntry(
                                             const Metadata *instanceMetadata) {
   ExistentialTypeFlags flags;
-  if (instanceMetadata->getKind() == MetadataKind::Existential) {
+  switch (instanceMetadata->getKind()) {
+  case MetadataKind::Existential:
     flags = static_cast<const ExistentialTypeMetadata*>(instanceMetadata)
       ->Flags;
-  } else {
-    assert(instanceMetadata->getKind() == MetadataKind::ExistentialMetatype);
+    break;
+  case MetadataKind::ExistentialMetatype:
     flags = static_cast<const ExistentialMetatypeMetadata*>(instanceMetadata)
       ->Flags;
+    break;
+  default:
+    assert(false && "expected existential metadata");
   }
 
   Data.setKind(MetadataKind::ExistentialMetatype);
@@ -4023,9 +4060,11 @@ swift::swift_getExistentialTypeMetadata(
   
   // Ensure that the "class constraint" bit is set whenever we have a
   // superclass or a one of the protocols is class-bound.
+#ifndef NDEBUG
   assert(classConstraint == ProtocolClassConstraint::Class ||
          (!superclassConstraint &&
           !anyProtocolIsClassBound(numProtocols, protocols)));
+#endif
   ExistentialCacheEntry::Key key = {
     superclassConstraint, classConstraint, (uint32_t)numProtocols, protocols
   };
@@ -4140,41 +4179,11 @@ public:
 
   static const char *getName() { return "ForeignMetadataCache"; }
 
-  template <class... Args>
-  ForeignMetadataCacheEntry(Key key,
+  ForeignMetadataCacheEntry(Key key, MetadataWaitQueue::Worker &worker,
                             MetadataRequest request, Metadata *candidate)
-      : Value(candidate) {
-    // Remember that the metadata is still just a candidate until this
-    // is actually successfully installed in the concurrent map.
-
-    auto &init = key.Description->getForeignMetadataInitialization();
-
-    PrivateMetadataState state;
-    if (!init.CompletionFunction) {
-      if (areAllTransitiveMetadataComplete_cheap(candidate)) {
-        state = PrivateMetadataState::Complete;
-      } else {
-        state = PrivateMetadataState::NonTransitiveComplete;
-      }
-    } else {
-      if (candidate->getValueWitnesses() == nullptr) {
-        assert(isa<ForeignClassMetadata>(candidate) &&
-               "cannot set default value witnesses for non-class foreign types");
-        // Fill in the default VWT if it was not set in the candidate at build
-        // time.
-#if SWIFT_OBJC_INTEROP
-        candidate->setValueWitnesses(&VALUE_WITNESS_SYM(BO));
-#else
-        candidate->setValueWitnesses(&VALUE_WITNESS_SYM(Bo));
-#endif
-      }
-      state = inferStateForMetadata(candidate);
-    }
-
-    flagAllocatedDuringConstruction(state);
+      : MetadataCacheEntryBase(worker, configureCandidate(key, candidate)),
+        Value(candidate) {
   }
-
-  enum : bool { MayFlagAllocatedDuringConstruction = true };
 
   const TypeContextDescriptor *getDescription() const {
     return getForeignTypeDescription(Value);
@@ -4201,10 +4210,10 @@ public:
   }
 
   AllocationResult allocate(Metadata *candidate) {
-    swift_unreachable("always flags allocation complete during construction");
+    swift_unreachable("allocation is short-circuited during construction");
   }
 
-  TryInitializeResult tryInitialize(Metadata *metadata,
+  MetadataStateWithDependency tryInitialize(Metadata *metadata,
                                     PrivateMetadataState state,
                                     PrivateMetadataCompletionContext *ctxt) {
     assert(state != PrivateMetadataState::Complete);
@@ -4230,6 +4239,36 @@ public:
 
     // We're done.
     return { PrivateMetadataState::Complete, MetadataDependency() };
+  }
+
+private:
+  /// Do as much candidate initialization as we reasonably can during
+  /// construction.  Remember, though, that this is just construction;
+  /// we won't have committed to this candidate as the metadata until
+  /// this entry is successfully installed in the concurrent map.
+  static PrivateMetadataState configureCandidate(Key key, Metadata *candidate) {
+    auto &init = key.Description->getForeignMetadataInitialization();
+
+    if (!init.CompletionFunction) {
+      if (areAllTransitiveMetadataComplete_cheap(candidate)) {
+        return PrivateMetadataState::Complete;
+      } else {
+        return PrivateMetadataState::NonTransitiveComplete;
+      }
+    }
+
+    if (candidate->getValueWitnesses() == nullptr) {
+      assert(isa<ForeignClassMetadata>(candidate) &&
+             "cannot set default value witnesses for non-class foreign types");
+      // Fill in the default VWT if it was not set in the candidate at build
+      // time.
+#if SWIFT_OBJC_INTEROP
+      candidate->setValueWitnesses(&VALUE_WITNESS_SYM(BO));
+#else
+      candidate->setValueWitnesses(&VALUE_WITNESS_SYM(Bo));
+#endif
+    }
+    return inferStateForMetadata(candidate);
   }
 };
 
@@ -4519,9 +4558,11 @@ public:
   /// Do the structural initialization necessary for this entry to appear
   /// in a concurrent map.
   WitnessTableCacheEntry(const Metadata *type,
+                         WaitQueue::Worker &worker,
                          const ProtocolConformanceDescriptor *conformance,
                          const void * const *instantiationArgs)
-    : Type(type), Conformance(conformance) {}
+    : SimpleLockingCacheEntryBase(worker),
+      Type(type), Conformance(conformance) {}
 
   intptr_t getKeyIntValueForDump() const {
     return reinterpret_cast<intptr_t>(Type);
@@ -4538,6 +4579,7 @@ public:
 
   static size_t getExtraAllocationSize(
                              const Metadata *type,
+                             WaitQueue::Worker &worker,
                              const ProtocolConformanceDescriptor *conformance,
                              const void * const *instantiationArgs) {
     return getWitnessTableSize(conformance);
@@ -5380,75 +5422,6 @@ static Result performOnMetadataCache(const Metadata *metadata,
                                                  cache, key);
 }
 
-bool swift::addToMetadataQueue(MetadataCompletionQueueEntry *queueEntry,
-                               MetadataDependency dependency) {
-  struct EnqueueCallbacks {
-    MetadataCompletionQueueEntry *QueueEntry;
-    MetadataDependency Dependency;
-
-    bool forGenericMetadata(const Metadata *metadata,
-                            const TypeContextDescriptor *description,
-                            GenericMetadataCache &cache,
-                            MetadataCacheKey key) && {
-      return cache.enqueue(key, QueueEntry, Dependency);
-    }
-
-    bool forForeignMetadata(const Metadata *metadata,
-                            const TypeContextDescriptor *description) {
-      ForeignMetadataCacheEntry::Key key{description};
-      return ForeignMetadata.get().enqueue(key, QueueEntry, Dependency);
-    }
-
-    bool forSingletonMetadata(const TypeContextDescriptor *description) && {
-      return SingletonMetadata.get().enqueue(description, QueueEntry, Dependency);
-    }
-
-    bool forTupleMetadata(const TupleTypeMetadata *metadata) {
-      return TupleTypes.get().enqueue(metadata, QueueEntry, Dependency);
-    }
-
-    bool forOtherMetadata(const Metadata *metadata) && {
-      swift_unreachable("metadata should always be complete");
-    }
-  } callbacks = { queueEntry, dependency };
-
-  return performOnMetadataCache<bool>(dependency.Value, std::move(callbacks));
-}
-
-void swift::resumeMetadataCompletion(MetadataCompletionQueueEntry *queueEntry) {
-  struct ResumeCallbacks {
-    MetadataCompletionQueueEntry *QueueEntry;
-
-    void forGenericMetadata(const Metadata *metadata,
-                            const TypeContextDescriptor *description,
-                            GenericMetadataCache &cache,
-                            MetadataCacheKey key) && {
-      cache.resumeInitialization(key, QueueEntry);
-    }
-
-    void forForeignMetadata(const Metadata *metadata,
-                            const TypeContextDescriptor *description) {
-      ForeignMetadataCacheEntry::Key key{description};
-      ForeignMetadata.get().resumeInitialization(key, QueueEntry);
-    }
-
-    void forSingletonMetadata(const TypeContextDescriptor *description) && {
-      SingletonMetadata.get().resumeInitialization(description, QueueEntry);
-    }
-
-    void forTupleMetadata(const TupleTypeMetadata *metadata) {
-      TupleTypes.get().resumeInitialization(metadata, QueueEntry);
-    }
-
-    void forOtherMetadata(const Metadata *metadata) && {
-      swift_unreachable("metadata should always be complete");
-    }
-  } callbacks = { queueEntry };
-
-  auto metadata = queueEntry->Value;
-  performOnMetadataCache<void>(metadata, std::move(callbacks));
-}
-
 MetadataResponse swift::swift_checkMetadataState(MetadataRequest request,
                                                  const Metadata *type) {
   struct CheckStateCallbacks {
@@ -5683,43 +5656,44 @@ checkTransitiveCompleteness(const Metadata *initialType) {
   }
 
   // Otherwise, we're transitively complete.
-  return { nullptr, MetadataState::Complete };
+  return MetadataDependency();
 }
 
 /// Diagnose a metadata dependency cycle.
 SWIFT_NORETURN static void
-diagnoseMetadataDependencyCycle(const Metadata *start,
-                                llvm::ArrayRef<MetadataDependency> links) {
-  assert(start == links.back().Value);
+diagnoseMetadataDependencyCycle(llvm::ArrayRef<MetadataDependency> links) {
+  assert(links.size() >= 2);
+  assert(links.front().Value == links.back().Value);
+
+  auto stringForRequirement = [](MetadataState req) -> const char * {
+    switch (req) {
+    case MetadataState::Complete:
+      return "transitive completion of ";
+    case MetadataState::NonTransitiveComplete:
+      return "completion of ";
+    case MetadataState::LayoutComplete:
+      return "layout of ";
+    case MetadataState::Abstract:
+      return "abstract metadata for ";
+    }
+    return "<corrupted requirement> for ";
+  };
 
   std::string diagnostic =
-    "runtime error: unresolvable type metadata dependency cycle detected\n  ";
-  diagnostic += nameForMetadata(start);
+    "runtime error: unresolvable type metadata dependency cycle detected\n"
+    "  Request for ";
+  diagnostic += stringForRequirement(links.front().Requirement);
+  diagnostic += nameForMetadata(links.front().Value);
 
-  for (auto &link : links) {
+  for (auto &link : links.drop_front()) {
     // If the diagnostic gets too large, just cut it short.
     if (diagnostic.size() >= 128 * 1024) {
-      diagnostic += "\n  (limiting diagnostic text at 128KB)";
+      diagnostic += "\n  (cycle too long, limiting diagnostic text)";
       break;
     }
 
     diagnostic += "\n  depends on ";
-
-    switch (link.Requirement) {
-    case MetadataState::Complete:
-      diagnostic += "transitive completion of ";
-      break;
-    case MetadataState::NonTransitiveComplete:
-      diagnostic += "completion of ";
-      break;
-    case MetadataState::LayoutComplete:
-      diagnostic += "layout of ";
-      break;
-    case MetadataState::Abstract:
-      diagnostic += "<corruption> of ";
-      break;
-    }
-
+    diagnostic += stringForRequirement(link.Requirement);
     diagnostic += nameForMetadata(link.Value);
   }
 
@@ -5733,7 +5707,7 @@ diagnoseMetadataDependencyCycle(const Metadata *start,
       .errorType = "type-metadata-cycle",
       .currentStackDescription = "fetching metadata", // TODO?
       .framesToSkip = 1, // skip out to the check function
-      .memoryAddress = start
+      .memoryAddress = links.front().Value
       // TODO: describe the cycle using notes instead of one huge message?
     };
 #pragma GCC diagnostic pop
@@ -5742,76 +5716,99 @@ diagnoseMetadataDependencyCycle(const Metadata *start,
                             &details);
   }
 
-  fatalError(0, diagnostic.c_str());
+  fatalError(0, "%s", diagnostic.c_str());
 }
 
 /// Check whether the given metadata dependency is satisfied, and if not,
 /// return its current dependency, if one exists.
-static MetadataDependency
+static MetadataStateWithDependency
 checkMetadataDependency(MetadataDependency dependency) {
-  struct IsIncompleteCallbacks {
+  struct CheckDependencyResult {
     MetadataState Requirement;
-    MetadataDependency forGenericMetadata(const Metadata *type,
-                                          const TypeContextDescriptor *desc,
-                                          GenericMetadataCache &cache,
-                                          MetadataCacheKey key) && {
+
+    MetadataStateWithDependency
+    forGenericMetadata(const Metadata *type,
+                       const TypeContextDescriptor *desc,
+                       GenericMetadataCache &cache,
+                       MetadataCacheKey key) && {
       return cache.checkDependency(key, Requirement);
     }
 
-    MetadataDependency forForeignMetadata(const Metadata *metadata,
-                                    const TypeContextDescriptor *description) {
+    MetadataStateWithDependency
+    forForeignMetadata(const Metadata *metadata,
+                       const TypeContextDescriptor *description) {
       ForeignMetadataCacheEntry::Key key{description};
       return ForeignMetadata.get().checkDependency(key, Requirement);
     }
 
-    MetadataDependency forSingletonMetadata(
-                              const TypeContextDescriptor *description) && {
+    MetadataStateWithDependency
+    forSingletonMetadata(const TypeContextDescriptor *description) {
       return SingletonMetadata.get().checkDependency(description, Requirement);
     }
 
-    MetadataDependency forTupleMetadata(const TupleTypeMetadata *metadata) {
+    MetadataStateWithDependency
+    forTupleMetadata(const TupleTypeMetadata *metadata) {
       return TupleTypes.get().checkDependency(metadata, Requirement);
     }
 
-    MetadataDependency forOtherMetadata(const Metadata *type) && {
-      return MetadataDependency();
+    MetadataStateWithDependency forOtherMetadata(const Metadata *type) {
+      return { PrivateMetadataState::Complete, MetadataDependency() };
     }
   } callbacks = { dependency.Requirement };
 
-  return performOnMetadataCache<MetadataDependency>(dependency.Value,
-                                                    std::move(callbacks));
+  return performOnMetadataCache<MetadataStateWithDependency>(dependency.Value,
+                                                       std::move(callbacks));
 }
 
 /// Check for an unbreakable metadata-dependency cycle.
-void swift::checkMetadataDependencyCycle(const Metadata *startMetadata,
-                                         MetadataDependency firstLink,
-                                         MetadataDependency secondLink) {
+void swift::blockOnMetadataDependency(MetadataDependency root,
+                                      MetadataDependency firstLink) {
   std::vector<MetadataDependency> links;
   auto checkNewLink = [&](MetadataDependency newLink) {
     links.push_back(newLink);
-    if (newLink.Value == startMetadata)
-      diagnoseMetadataDependencyCycle(startMetadata, links);
     for (auto i = links.begin(), e = links.end() - 1; i != e; ++i) {
       if (i->Value == newLink.Value) {
-        auto next = i + 1;
-        diagnoseMetadataDependencyCycle(i->Value,
-                                llvm::makeArrayRef(&*next, links.end() - next));
+        diagnoseMetadataDependencyCycle(
+          llvm::makeArrayRef(&*i, links.end() - i));
       }
     }
   };
 
+  links.push_back(root);
+
+  // Iteratively add each link, checking for a cycle, until we reach
+  // something without a known dependency.
   checkNewLink(firstLink);
-  checkNewLink(secondLink);
   while (true) {
-    auto newLink = checkMetadataDependency(links.back());
-    if (!newLink) return;
-    checkNewLink(newLink);
+    // Try to get a dependency for the metadata in the last link we added.
+    auto checkResult = checkMetadataDependency(links.back());
+
+    // If there isn't a known dependency, we can't do any more checking.
+    if (!checkResult.Dependency) {
+      // In the special case where it's the first link that doesn't have
+      // a known dependency and its current metadata state now satisfies
+      // the dependency leading to it, we can skip waiting.
+      if (links.size() == 2 && 
+          satisfies(checkResult.NewState, links.back().Requirement))
+        return;
+
+      // Otherwise, just make a blocking request for the first link in
+      // the chain.
+      auto request = MetadataRequest(firstLink.Requirement);
+      swift_checkMetadataState(request, firstLink.Value);
+      return;
+    }
+
+    // Check the new link.
+    checkNewLink(checkResult.Dependency);
   }
 }
 
 /***************************************************************************/
 /*** Allocator implementation **********************************************/
 /***************************************************************************/
+
+#if !SWIFT_STDLIB_PASSTHROUGH_METADATA_ALLOCATOR
 
 namespace {
   struct alignas(sizeof(uintptr_t) * 2) PoolRange {
@@ -5942,9 +5939,9 @@ void *MetadataAllocator::Allocate(size_t size, size_t alignment) {
   static OnceToken_t getenvToken;
   SWIFT_ONCE_F(getenvToken, checkAllocatorDebugEnvironmentVariables, nullptr);
 
-  // If the size is larger than the maximum, just use malloc.
+  // If the size is larger than the maximum, just do a normal heap allocation.
   if (size > PoolRange::MaxPoolAllocationSize) {
-    void *allocation = malloc(size);
+    void *allocation = swift_slowAlloc(size, alignment - 1);
     memsetScribble(allocation, size);
     return allocation;
   }
@@ -5982,6 +5979,21 @@ void *MetadataAllocator::Allocate(size_t size, size_t alignment) {
       newState = PoolRange{allocation + sizeWithHeader,
                            poolSize - sizeWithHeader};
       __asan_poison_memory_region(allocation, newState.Remaining);
+    }
+
+    // NULL should be impossible, but check anyway in case of bugs or corruption
+    if (SWIFT_UNLIKELY(!allocation)) {
+      PoolRange curStateReRead = AllocationPool.load(std::memory_order_relaxed);
+      swift::fatalError(
+          0,
+          "Metadata allocator corruption: allocation is NULL. "
+          "curState: {%p, %zu} - curStateReRead: {%p, %zu} - "
+          "newState: {%p, %zu} - allocatedNewPage: %s - requested size: %zu - "
+          "sizeWithHeader: %zu - alignment: %zu - Tag: %d\n",
+          curState.Begin, curState.Remaining, curStateReRead.Begin,
+          curStateReRead.Remaining, newState.Begin, newState.Remaining,
+          allocatedNewPage ? "true" : "false", size, sizeWithHeader, alignment,
+          Tag);
     }
 
     // Swap in the new state.
@@ -6024,7 +6036,7 @@ void MetadataAllocator::Deallocate(const void *allocation, size_t size,
   __asan_poison_memory_region(allocation, size);
 
   if (size > PoolRange::MaxPoolAllocationSize) {
-    free(const_cast<void*>(allocation));
+    swift_slowDealloc(const_cast<void *>(allocation), size, Alignment - 1);
     return;
   }
 
@@ -6049,6 +6061,8 @@ void MetadataAllocator::Deallocate(const void *allocation, size_t size,
                                                  std::memory_order_relaxed,
                                                  std::memory_order_relaxed);
 }
+
+#endif
 
 void *swift::allocateMetadata(size_t size, size_t alignment) {
   return MetadataAllocator(MetadataTag).Allocate(size, alignment);
@@ -6080,26 +6094,33 @@ void swift::verifyMangledNameRoundtrip(const Metadata *metadata) {
   // us stress test the mangler/demangler and type lookup machinery.
   if (!swift::runtime::environment::SWIFT_ENABLE_MANGLED_NAME_VERIFICATION())
     return;
-  
+
   Demangle::StackAllocatedDemangler<1024> Dem;
   auto node = _swift_buildDemanglingForMetadata(metadata, Dem);
   // If the mangled node involves types in an AnonymousContext, then by design,
   // it cannot be looked up by name.
   if (referencesAnonymousContext(node))
     return;
-  
-  auto mangledName = Demangle::mangleNode(node);
-  auto result =
-    swift_getTypeByMangledName(MetadataState::Abstract,
-                          mangledName,
-                          nullptr,
-                          [](unsigned, unsigned){ return nullptr; },
-                          [](const Metadata *, unsigned) { return nullptr; })
-      .getType().getMetadata();
-  if (metadata != result)
+
+  auto mangling = Demangle::mangleNode(node);
+  if (!mangling.isSuccess()) {
     swift::warning(RuntimeErrorFlagNone,
-                   "Metadata mangled name failed to roundtrip: %p -> %s -> %p\n",
-                   metadata, mangledName.c_str(), (const Metadata *)result);
+                   "Metadata mangled name failed to roundtrip: %p couldn't be mangled\n",
+                   metadata);
+  } else {
+    std::string mangledName = mangling.result();
+    auto result =
+      swift_getTypeByMangledName(MetadataState::Abstract,
+                                 mangledName,
+                                 nullptr,
+                                 [](unsigned, unsigned){ return nullptr; },
+                                 [](const Metadata *, unsigned) { return nullptr; })
+      .getType().getMetadata();
+    if (metadata != result)
+      swift::warning(RuntimeErrorFlagNone,
+                     "Metadata mangled name failed to roundtrip: %p -> %s -> %p\n",
+                     metadata, mangledName.c_str(), (const Metadata *)result);
+  }
 }
 #endif
 
@@ -6118,17 +6139,6 @@ const HeapObject *swift_getKeyPathImpl(const void *pattern,
 #define OVERRIDE_KEYPATH COMPATIBILITY_OVERRIDE
 #define OVERRIDE_WITNESSTABLE COMPATIBILITY_OVERRIDE
 #include COMPATIBILITY_OVERRIDE_INCLUDE_PATH
-
-#if defined(_WIN32) && defined(_M_ARM64)
-namespace std {
-template <>
-inline void _Atomic_storage<::PoolRange, 16>::_Unlock() const noexcept {
-  __dmb(0x8);
-  __iso_volatile_store32(&reinterpret_cast<volatile int &>(_Spinlock), 0);
-  __dmb(0x8);
-}
-}
-#endif
 
 // Autolink with libc++, for cases where libswiftCore is linked statically.
 #if defined(__MACH__)

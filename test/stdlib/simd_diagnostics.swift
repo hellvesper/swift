@@ -2,6 +2,7 @@
 
 // FIXME: No simd module on linux rdar://problem/20795411
 // XFAIL: linux, windows, openbsd, freebsd
+// XFAIL: OS=wasi
 
 import simd
 

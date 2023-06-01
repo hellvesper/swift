@@ -317,9 +317,6 @@ public:
              LookupConformanceFn conformances,
              SubstOptions options=None) const;
 
-  /// Replace references to substitutable types with error types.
-  Type substDependentTypesWithErrorTypes() const;
-  
   bool isPrivateStdlibType(bool treatNonBuiltinProtocolsAsPublic = true) const;
 
   SWIFT_DEBUG_DUMP;
@@ -388,6 +385,7 @@ class CanType : public Type {
 
   static bool isReferenceTypeImpl(CanType type, const GenericSignatureImpl *sig,
                                   bool functionsCount);
+  static bool isConstraintTypeImpl(CanType type);
   static bool isExistentialTypeImpl(CanType type);
   static bool isAnyExistentialTypeImpl(CanType type);
   static bool isObjCExistentialTypeImpl(CanType type);
@@ -458,6 +456,10 @@ public:
     return isReferenceTypeImpl(*this,
                                /*signature*/ nullptr,
                                /*functions count*/ false);
+  }
+
+  bool isConstraintType() const {
+    return isConstraintTypeImpl(*this);
   }
 
   /// Is this type existential?

@@ -245,7 +245,9 @@ extension _NativeDictionary { // ensureUnique
   }
 
   /// Ensure storage of self is uniquely held and can hold at least `capacity`
-  /// elements. Returns true iff contents were rehashed.
+  /// elements.
+  ///
+  /// -Returns: `true` if contents were rehashed; otherwise, `false`.
   @inlinable
   @_semantics("optimize.sil.specialize.generic.size.never")
   internal mutating func ensureUnique(isUnique: Bool, capacity: Int) -> Bool {
@@ -354,6 +356,10 @@ extension _NativeDictionary: _DictionaryBuffer {
   @inlinable
   @inline(__always)
   func contains(_ key: Key) -> Bool {
+    if count == 0 {
+      // Fast path that avoids computing the hash of the key.
+      return false
+    }
     return find(key).found
   }
 

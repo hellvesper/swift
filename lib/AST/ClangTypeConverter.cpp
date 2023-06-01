@@ -85,6 +85,10 @@ getClangBuiltinTypeFromKind(const clang::ASTContext &context,
   case clang::BuiltinType::Id:                                                 \
     return context.Id##Ty;
 #include "clang/Basic/PPCTypes.def"
+#define RVV_TYPE(Name, Id, SingletonId)                                        \
+  case clang::BuiltinType::Id:                                                 \
+    return context.Id##Ty;
+#include "clang/Basic/RISCVVTypes.def"
   }
 
   // Not a valid BuiltinType.
@@ -745,6 +749,11 @@ ClangTypeConverter::visitProtocolCompositionType(ProtocolCompositionType *type) 
 }
 
 clang::QualType
+ClangTypeConverter::visitExistentialType(ExistentialType *type) {
+  return visit(type->getConstraintType());
+}
+
+clang::QualType
 ClangTypeConverter::visitBuiltinRawPointerType(BuiltinRawPointerType *type) {
   return ClangASTContext.VoidPtrTy;
 }
@@ -784,6 +793,10 @@ clang::QualType ClangTypeConverter::visitArchetypeType(ArchetypeType *type) {
   return getClangIdType(ClangASTContext);
 }
 
+clang::QualType ClangTypeConverter::visitDependentMemberType(DependentMemberType *type) {
+  return convert(type->getBase());
+}
+
 clang::QualType ClangTypeConverter::visitDynamicSelfType(DynamicSelfType *type) {
   // Dynamic Self is equivalent to 'instancetype', which is treated as
   // 'id' within the Objective-C type system.
@@ -818,6 +831,9 @@ clang::QualType ClangTypeConverter::convert(Type type) {
     return it->second;
 
   // Try to do this without making cache entries for obvious cases.
+  if (auto existential = type->getAs<ExistentialType>())
+    type = existential->getConstraintType();
+
   if (auto nominal = type->getAs<NominalType>()) {
     auto decl = nominal->getDecl();
     if (auto clangDecl = decl->getClangDecl()) {
@@ -865,7 +881,6 @@ ClangTypeConverter::getClangTemplateArguments(
     ArrayRef<Type> genericArgs,
     SmallVectorImpl<clang::TemplateArgument> &templateArgs) {
   assert(templateArgs.size() == 0);
-  assert(genericArgs.size() == templateParams->size());
 
   // Keep track of the types we failed to convert so we can return a useful
   // error.
@@ -874,6 +889,13 @@ ClangTypeConverter::getClangTemplateArguments(
     // Note: all template parameters must be template type parameters. This is
     // verified when we import the Clang decl.
     auto templateParam = cast<clang::TemplateTypeParmDecl>(param);
+    // We must have found a defaulted parameter at the end of the list.
+    if (templateParam->getIndex() >= genericArgs.size()) {
+      templateArgs.push_back(
+          clang::TemplateArgument(templateParam->getDefaultArgument()));
+      continue;
+    }
+
     auto replacement = genericArgs[templateParam->getIndex()];
     auto qualType = convert(replacement);
     if (qualType.isNull()) {

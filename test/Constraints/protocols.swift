@@ -1,4 +1,5 @@
 // RUN: %target-typecheck-verify-swift
+// RUN: %target-typecheck-verify-swift -enable-explicit-existential-types
 
 protocol Fooable { func foo() }
 protocol Barable { func bar() }
@@ -136,7 +137,7 @@ func generic<T: P>(_ t: T) {
   let _: (T) -> (Int) -> () = id(T.bar)
   let _: (Int) -> () = id(T.bar(t))
 
-  _ = t.mut // expected-error{{partial application of 'mutating' method is not allowed}}
+  _ = t.mut // expected-error{{cannot reference 'mutating' method as function value}}
   _ = t.tum // expected-error{{static member 'tum' cannot be used on instance of type 'T'}}
 }
 
@@ -167,7 +168,7 @@ func existential(_ p: P) {
   var p = p
   // Fully applied mutating method
   p.mut(1)
-  _ = p.mut // expected-error{{partial application of 'mutating' method is not allowed}}
+  _ = p.mut // expected-error{{cannot reference 'mutating' method as function value}}
 
   // Instance member of existential)
   let _: (Int) -> () = id(p.bar)
@@ -212,7 +213,7 @@ func staticExistential(_ p: P.Type, pp: P.Protocol) {
   // Instance member of existential metatype -- not allowed
   _ = p.bar // expected-error{{instance member 'bar' cannot be used on type 'P'}}
   _ = p.mut // expected-error{{instance member 'mut' cannot be used on type 'P'}}
-  // expected-error@-1 {{partial application of 'mutating' method is not allowed}}
+  // expected-error@-1 {{cannot reference 'mutating' method as function value}}
 
   // Static member of metatype -- not allowed
   _ = pp.tum // expected-error{{static member 'tum' cannot be used on protocol metatype 'P.Protocol'}}

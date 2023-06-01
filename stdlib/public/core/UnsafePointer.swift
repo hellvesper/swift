@@ -205,7 +205,7 @@
 ///       let numberPointer = UnsafePointer<Int>(&number)
 ///       // Accessing 'numberPointer' is undefined behavior.
 @frozen // unsafe-performance
-public struct UnsafePointer<Pointee>: _Pointer, Sendable {
+public struct UnsafePointer<Pointee>: _Pointer {
 
   /// A type that represents the distance between two pointers.
   public typealias Distance = Int
@@ -511,7 +511,7 @@ public struct UnsafePointer<Pointee>: _Pointer, Sendable {
 ///       let numberPointer = UnsafeMutablePointer<Int>(&number)
 ///       // Accessing 'numberPointer' is undefined behavior.
 @frozen // unsafe-performance
-public struct UnsafeMutablePointer<Pointee>: _Pointer, Sendable {
+public struct UnsafeMutablePointer<Pointee>: _Pointer {
 
   /// A type that represents the distance between two pointers.
   public typealias Distance = Int
@@ -888,8 +888,8 @@ public struct UnsafeMutablePointer<Pointee>: _Pointer, Sendable {
   @discardableResult
   public func deinitialize(count: Int) -> UnsafeMutableRawPointer {
     _debugPrecondition(count >= 0, "UnsafeMutablePointer.deinitialize with negative count")
-    // FIXME: optimization should be implemented, where if the `count` value
-    // is 1, the `Builtin.destroy(Pointee.self, _rawValue)` gets called.
+    // TODO: IRGen optimization when `count` value is statically known to be 1,
+    //       then call `Builtin.destroy(Pointee.self, _rawValue)` instead.
     Builtin.destroyArray(Pointee.self, _rawValue, count._builtinWordValue)
     return UnsafeMutableRawPointer(self)
   }

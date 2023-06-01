@@ -197,11 +197,10 @@ public:
       DC = omDecl->getCanonicalDecl();
     } else if (auto fDecl = dyn_cast<clang::FunctionDecl>(dc)) {
       DC = fDecl->getCanonicalDecl();
-    } else if (auto nsDecl = dyn_cast<clang::NamespaceDecl>(dc)) {
-      DC = nsDecl->getCanonicalDecl();
     } else {
       assert(isa<clang::TranslationUnitDecl>(dc) ||
              isa<clang::LinkageSpecDecl>(dc) ||
+             isa<clang::NamespaceDecl>(dc) ||
              isa<clang::ObjCContainerDecl>(dc) &&
                  "No other kinds of effective Clang contexts");
       DC = dc;
@@ -277,7 +276,7 @@ const uint16_t SWIFT_LOOKUP_TABLE_VERSION_MAJOR = 1;
 /// Lookup table minor version number.
 ///
 /// When the format changes IN ANY WAY, this number should be incremented.
-const uint16_t SWIFT_LOOKUP_TABLE_VERSION_MINOR = 16; // Lazy Member Loading Index
+const uint16_t SWIFT_LOOKUP_TABLE_VERSION_MINOR = 17; // Lazy Member Loading Index
 
 /// A lookup table that maps Swift names to the set of Clang
 /// declarations with that particular name.

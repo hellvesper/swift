@@ -70,8 +70,9 @@ TypeDecl *swift::Demangle::getTypeDeclForUSR(ASTContext &ctx,
   return getTypeDeclForMangling(ctx, mangling);
 }
 
-Type ASTBuilder::decodeMangledType(NodePointer node) {
-  return swift::Demangle::decodeMangledType(*this, node).getType();
+Type ASTBuilder::decodeMangledType(NodePointer node, bool forRequirement) {
+  return swift::Demangle::decodeMangledType(*this, node, forRequirement)
+      .getType();
 }
 
 TypeDecl *ASTBuilder::createTypeDecl(NodePointer node) {
@@ -205,7 +206,7 @@ createSubstitutionMapFromGenericArgs(GenericSignature genericSig,
   if (!genericSig)
     return SubstitutionMap();
   
-  if (genericSig->getGenericParams().size() != args.size())
+  if (genericSig.getGenericParams().size() != args.size())
     return SubstitutionMap();
 
   return SubstitutionMap::get(
@@ -250,8 +251,11 @@ Type ASTBuilder::resolveOpaqueType(NodePointer opaqueDescriptor,
     auto definingDecl = opaqueDescriptor->getChild(0);
     auto definingGlobal = Factory.createNode(Node::Kind::Global);
     definingGlobal->addChild(definingDecl, Factory);
-    auto mangledName = mangleNode(definingGlobal);
-    
+    auto mangling = mangleNode(definingGlobal);
+    if (!mangling.isSuccess())
+      return Type();
+    auto mangledName = mangling.result();
+
     auto moduleNode = findModuleNode(definingDecl);
     if (!moduleNode)
       return Type();
@@ -262,7 +266,7 @@ Type ASTBuilder::resolveOpaqueType(NodePointer opaqueDescriptor,
     auto opaqueDecl = parentModule->lookupOpaqueResultType(mangledName);
     if (!opaqueDecl)
       return Type();
-    // TODO: multiple opaque types
+    // TODO [OPAQUE SUPPORT]: multiple opaque types
     assert(ordinal == 0 && "not implemented");
     if (ordinal != 0)
       return Type();
@@ -275,7 +279,7 @@ Type ASTBuilder::resolveOpaqueType(NodePointer opaqueDescriptor,
     SubstitutionMap subs = createSubstitutionMapFromGenericArgs(
         opaqueDecl->getGenericSignature(), allArgs,
         LookUpConformanceInModule(parentModule));
-    return OpaqueTypeArchetypeType::get(opaqueDecl, subs);
+    return OpaqueTypeArchetypeType::get(opaqueDecl, ordinal, subs);
   }
   
   // TODO: named opaque types
@@ -306,7 +310,7 @@ Type ASTBuilder::createBoundGenericType(GenericTypeDecl *decl,
 
   auto genericSig = aliasDecl->getGenericSignature();
   for (unsigned i = 0, e = args.size(); i < e; ++i) {
-    auto origTy = genericSig->getInnermostGenericParams()[i];
+    auto origTy = genericSig.getInnermostGenericParams()[i];
     auto substTy = args[i];
 
     subs[origTy->getCanonicalType()->castTo<GenericTypeParamType>()] =
@@ -580,13 +584,19 @@ Type ASTBuilder::createImplFunctionType(
 Type ASTBuilder::createProtocolCompositionType(
     ArrayRef<ProtocolDecl *> protocols,
     Type superclass,
-    bool isClassBound) {
+    bool isClassBound,
+    bool forRequirement) {
   std::vector<Type> members;
   for (auto protocol : protocols)
     members.push_back(protocol->getDeclaredInterfaceType());
   if (superclass && superclass->getClassOrBoundGenericClass())
     members.push_back(superclass);
-  return ProtocolCompositionType::get(Ctx, members, isClassBound);
+
+  Type composition = ProtocolCompositionType::get(Ctx, members, isClassBound);
+  if (forRequirement)
+    return composition;
+
+  return ExistentialType::get(composition);
 }
 
 static MetatypeRepresentation
@@ -604,6 +614,8 @@ getMetatypeRepresentation(ImplMetatypeRepresentation repr) {
 
 Type ASTBuilder::createExistentialMetatypeType(Type instance,
                           Optional<Demangle::ImplMetatypeRepresentation> repr) {
+  if (auto existential = instance->getAs<ExistentialType>())
+    instance = existential->getConstraintType();
   if (!instance->isAnyExistentialType())
     return Type();
   if (!repr)
@@ -623,7 +635,7 @@ Type ASTBuilder::createMetatypeType(Type instance,
 
 Type ASTBuilder::createGenericTypeParameterType(unsigned depth,
                                                 unsigned index) {
-  return GenericTypeParamType::get(depth, index, Ctx);
+  return GenericTypeParamType::get(/*type sequence*/ false, depth, index, Ctx);
 }
 
 Type ASTBuilder::createDependentMemberType(StringRef member,
@@ -894,12 +906,8 @@ CanGenericSignature ASTBuilder::demangleGenericSignature(
 
   decodeRequirement<BuiltType, BuiltRequirement, BuiltLayoutConstraint,
                     ASTBuilder>(node, requirements, *this);
-  return evaluateOrDefault(Ctx.evaluator,
-                           AbstractGenericSignatureRequest{
-                               nominalDecl->getGenericSignature().getPointer(),
-                               {},
-                               std::move(requirements)},
-                           GenericSignature())
+  return buildGenericSignature(Ctx, nominalDecl->getGenericSignature(),
+                               {}, std::move(requirements))
       .getCanonicalSignature();
 }
 
@@ -935,7 +943,10 @@ ASTBuilder::findDeclContext(NodePointer node) {
       if (!module) return nullptr;
 
       // Look up the local type by its mangling.
-      auto mangledName = Demangle::mangleNode(node);
+      auto mangling = Demangle::mangleNode(node);
+      if (!mangling.isSuccess()) return nullptr;
+      auto mangledName = mangling.result();
+
       auto decl = module->lookupLocalType(mangledName);
       if (!decl) return nullptr;
 

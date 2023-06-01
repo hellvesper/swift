@@ -87,14 +87,24 @@ public:
   /// Used to determine if we need to verify a DeadEndBlocks.
   bool isComputed() const { return didComputeValue; }
 
+  /// Add any (new) blocks that are backward-reachable from \p reachableBB to
+  /// the set of reachable blocks.
+  void updateForReachableBlock(SILBasicBlock *reachableBB);
+
+  /// Add new blocks to the set of reachable blocks.
+  void updateForNewBlock(SILBasicBlock *newBB);
+
   const SILFunction *getFunction() const { return f; }
-  
+
   /// Performs a simple check if \p block (or its single successor) ends in an
   /// "unreachable".
   ///
   /// This handles the common case of failure-handling blocks, which e.g.
   /// contain a call to fatalError().
   static bool triviallyEndsInUnreachable(SILBasicBlock *block);
+
+protected:
+  void propagateNewlyReachableBlocks(unsigned startIdx);
 };
 
 /// Compute joint-postdominating set for \p dominatingBlock and \p
@@ -140,6 +150,10 @@ void findJointPostDominatingSet(
     function_ref<void(SILBasicBlock *)> inputBlocksFoundDuringWalk,
     function_ref<void(SILBasicBlock *)> foundJointPostDomSetCompletionBlocks,
     function_ref<void(SILBasicBlock *)> inputBlocksInJointPostDomSet = {});
+
+#ifndef NDEBUG
+bool checkDominates(SILBasicBlock *sourceBlock, SILBasicBlock *destBlock);
+#endif
 
 } // namespace swift
 

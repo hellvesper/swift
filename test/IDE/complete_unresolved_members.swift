@@ -147,7 +147,7 @@ class C4 {
 // UNRESOLVED_3: Begin completions, 3 items
 // UNRESOLVED_3-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Identical]: North[#SomeEnum1#]; name=North
 // UNRESOLVED_3-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Identical]: South[#SomeEnum1#]; name=South
-// UNRESOLVED_3-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Invalid]: hash({#(self): SomeEnum1#})[#(into: inout Hasher) -> Void#]; name=hash(self: SomeEnum1)
+// UNRESOLVED_3-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Invalid]: hash({#(self): SomeEnum1#})[#(into: inout Hasher) -> Void#]; name=hash(:)
 // UNRESOLVED_3: End completions
 
 // Exhaustive to make sure we don't include `init({#(some):` or `init({#nilLiteral:` entries
@@ -192,7 +192,7 @@ func testOptionalWithCustomExtension() {
 // UNRESOLVED_OPT_4-DAG: Keyword[nil]/None/Erase[1]/TypeRelation[Identical]: nil[#Somewhere?#]; name=nil
 // UNRESOLVED_OPT_4-DAG: Decl[EnumElement]/CurrNominal/IsSystem/TypeRelation[Identical]: none[#Optional<Somewhere>#]; name=none
 // UNRESOLVED_OPT_4-DAG: Decl[EnumElement]/CurrNominal/IsSystem/TypeRelation[Identical]: some({#Somewhere#})[#Optional<Somewhere>#];
-// UNRESOLVED_OPT_4-DAG: Decl[Constructor]/CurrNominal/TypeRelation[Identical]: init({#str: String#})[#Optional<Somewhere>#]; name=init(str: String)
+// UNRESOLVED_OPT_4-DAG: Decl[Constructor]/CurrNominal/TypeRelation[Identical]: init({#str: String#})[#Optional<Somewhere>#]; name=init(str:)
 // UNRESOLVED_OPT_4-DAG: Decl[StaticVar]/CurrNominal/TypeRelation[Identical]: nowhere[#Optional<Somewhere>#]; name=nowhere
 // UNRESOLVED_OPT_4-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem: map({#(self): Optional<Somewhere>#})[#((Somewhere) throws -> U) -> U?#];
 // UNRESOLVED_OPT_4-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem: flatMap({#(self): Optional<Somewhere>#})[#((Somewhere) throws -> U?) -> U?#];
@@ -439,12 +439,13 @@ struct AnotherTy: MyProtocol {}
 func testSubType() {
   var _: BaseClass = .#^SUBTYPE_1^#
 }
-// SUBTYPE_1: Begin completions, 4 items
-// SUBTYPE_1-NOT: Concrete1(
+// SUBTYPE_1: Begin completions, 6 items
 // SUBTYPE_1-DAG: Decl[Constructor]/CurrNominal/TypeRelation[Identical]: init()[#BaseClass#];
 // SUBTYPE_1-DAG: Decl[Class]/CurrNominal/TypeRelation[Convertible]: SubClass[#BaseClass.SubClass#];
 // SUBTYPE_1-DAG: Decl[StaticVar]/CurrNominal/TypeRelation[Convertible]: subInstance[#BaseClass.SubClass#];
 // SUBTYPE_1-DAG: Decl[Constructor]/CurrNominal:      init({#failable: Void#})[#BaseClass?#];
+// SUBTYPE_1-DAG: Decl[TypeAlias]/Super/TypeRelation[Identical]: Concrete1[#BaseClass#];
+// SUBTYPE_1-DAG: Decl[TypeAlias]/Super:              Concrete2[#AnotherTy#];
 // SUBTYPE_1: End completions
 
 func testMemberTypealias() {
@@ -476,7 +477,6 @@ case let .#^GENERIC_4?check=GENERIC_1_INT^#
 // GENERIC_1_INT: Begin completions
 // GENERIC_1_INT-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Identical]: contains({#content: Int#})[#Generic<Int>#];
 // GENERIC_1_INT-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Identical]: empty[#Generic<Int>#];
-// GENERIC_1_INT-DAG: Decl[StaticMethod]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Identical]: create({#Int#})[#Generic<Int>#];
 // GENERIC_1_INT: End completions
 
 // GENERIC_1_U: Begin completions
@@ -523,7 +523,7 @@ func testOverload(val: HasOverloaded) {
 // Same as OVERLOADED_METHOD_1.
 }
 
-protocol HasStatic {
+protocol HasStatic: Equatable {
   static var instance: Self { get }
 }
 func receiveHasStatic<T: HasStatic>(x: T)  {}
