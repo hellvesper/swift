@@ -93,7 +93,7 @@ option(SWIFT_BUILD_DYNAMIC_STDLIB
 option(SWIFT_BUILD_STATIC_STDLIB
     "Build static variants of the Swift standard library"
     FALSE)
-    
+
 option(SWIFT_STDLIB_STATIC_PRINT
     "Build compile-time evaluated vprintf()"
     FALSE)
@@ -739,17 +739,18 @@ set(SWIFT_HOST_VARIANT_ARCH "${SWIFT_HOST_VARIANT_ARCH_default}" CACHE STRING
 # build environment.
 if(LLVM_USE_LINKER)
   set(SWIFT_USE_LINKER_default "${LLVM_USE_LINKER}")
-elseif(${SWIFT_HOST_VARIANT_SDK} STREQUAL ANDROID)
-  set(SWIFT_USE_LINKER_default "lld")
 elseif(CMAKE_SYSTEM_NAME STREQUAL Windows AND NOT CMAKE_HOST_SYSTEM_NAME STREQUAL Windows)
   set(SWIFT_USE_LINKER_default "lld")
 elseif(CMAKE_SYSTEM_NAME STREQUAL Darwin)
+  set(SWIFT_USE_LINKER_default "")
+elseif(CMAKE_SYSTEM_NAME STREQUAL FreeBSD)
   set(SWIFT_USE_LINKER_default "")
 else()
   set(SWIFT_USE_LINKER_default "gold")
 endif()
 set(SWIFT_USE_LINKER ${SWIFT_USE_LINKER_default} CACHE STRING
-    "Build Swift with a non-default linker")
+        "Build Swift with a non-default linker")
+
 
 #
 # Enable additional warnings.

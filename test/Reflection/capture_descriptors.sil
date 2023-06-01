@@ -3,6 +3,7 @@
 
 // SR-12893
 // XFAIL: openbsd
+// XFAIL: freebsd
 // UNSUPPORTED: OS=linux-android, OS=linux-androideabi
 
 // RUN: %empty-directory(%t)

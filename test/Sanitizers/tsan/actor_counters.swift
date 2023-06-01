@@ -7,6 +7,7 @@
 // UNSUPPORTED: use_os_stdlib
 // UNSUPPORTED: linux
 // UNSUPPORTED: windows
+// UNSUPPORTED: freebsd
 
 @available(SwiftStdlib 5.1, *)
 actor Counter {
